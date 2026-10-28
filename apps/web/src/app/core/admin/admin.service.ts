@@ -1,0 +1,134 @@
+import { Injectable, inject } from '@angular/core';
+import { ApiService } from '../account/api.service';
+import type { MembershipType } from '../membership/membership';
+
+export interface AdminStats {
+  accounts_total: number;
+  accounts_deleted: number;
+  memberships: Partial<Record<'free' | 'paid' | 'admin', number>>;
+  subscriptions: Record<string, number>;
+  devices_active: number;
+  sync_ops: number;
+  sync_bytes: number;
+  snapshots: number;
+  snapshot_bytes: number;
+  latest_release: string | null;
+  service_version: string;
+  database: string;
+  /** The separate ads admin console (apps/ads-admin); "" = not configured. */
+  ads_admin_url: string;
+}
+
+export interface AdminAccount {
+  id: string;
+  email: string;
+  role: 'user' | 'admin';
+  membership: MembershipType;
+  plan: string;
+  status: string;
+  current_period_end: string | null;
+  created_at: string;
+  deleted_at: string | null;
+  devices_active: number;
+  last_seen_at: string | null;
+  two_factor_enabled: boolean;
+  /** totp | sms | email */
+  two_factor_methods: string[];
+  /** Masked ("+•••••••0100") — lets support confirm the number with the user. */
+  two_factor_phone: string | null;
+}
+
+export interface AdminAuditEntry {
+  at: string;
+  actor_account_id: string | null;
+  actor_email: string | null;
+  action: string;
+  detail: Record<string, unknown>;
+}
+
+export interface AdminAccountDetail extends AdminAccount {
+  vault_enabled: boolean;
+  /** False for a "Sign in with Google/Facebook" account that has not chosen its passphrase yet. */
+  has_password: boolean;
+  /** Providers linked for sign-in: google | facebook */
+  oauth_providers: string[];
+  provider: string;
+  cancel_at_period_end: boolean;
+  features: string[];
+  max_active_tasks: number | null;
+  devices: {
+    id: string;
+    platform: string;
+    client_version: string;
+    schema_version: number;
+    cursor: number;
+    created_at: string;
+    last_seen_at: string;
+  }[];
+  sync_ops: number;
+  sync_bytes: number;
+  snapshot_bytes: number | null;
+  audit: AdminAuditEntry[];
+}
+
+export interface AdminAccountPage {
+  items: AdminAccount[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export type MembershipGrant =
+  | { plan: 'pro'; days?: number; note?: string }
+  | { plan: 'lifetime'; note?: string }
+  | { plan: 'free'; status?: 'none' | 'canceled'; note?: string };
+
+/** Administrator API (production support). Only reachable with an admin account (403 otherwise). */
+@Injectable({ providedIn: 'root' })
+export class AdminService {
+  private readonly api = inject(ApiService);
+
+  stats() {
+    return this.api.get<AdminStats>('/admin/stats');
+  }
+
+  accounts(q = '', membership: MembershipType | '' = '', includeDeleted = false, limit = 50) {
+    const params = new URLSearchParams({ q, membership, limit: String(limit) });
+    if (includeDeleted) params.set('include_deleted', 'true');
+    return this.api.get<AdminAccountPage>(`/admin/accounts?${params}`);
+  }
+
+  account(id: string) {
+    return this.api.get<AdminAccountDetail>(`/admin/accounts/${id}`);
+  }
+
+  setMembership(id: string, grant: MembershipGrant) {
+    return this.api.patch<AdminAccountDetail>(`/admin/accounts/${id}/membership`, grant);
+  }
+
+  setRole(id: string, role: 'user' | 'admin') {
+    return this.api.patch<AdminAccountDetail>(`/admin/accounts/${id}/role`, { role });
+  }
+
+  signOutEverywhere(id: string) {
+    return this.api.post<AdminAccountDetail>(`/admin/accounts/${id}/sign-out`);
+  }
+
+  /** Support action: remove the second factor of a user who lost authenticator and recovery
+   *  codes (verify their identity first). Signs the account out everywhere. */
+  resetTwoFactor(id: string) {
+    return this.api.post<AdminAccountDetail>(`/admin/accounts/${id}/2fa/reset`);
+  }
+
+  deleteAccount(id: string) {
+    return this.api.delete<void>(`/admin/accounts/${id}`);
+  }
+
+  audit(limit = 100) {
+    return this.api.get<AdminAuditEntry[]>(`/admin/audit?limit=${limit}`);
+  }
+
+  // Advertising (campaigns, ad source, analytics, compliance) is deliberately NOT managed from
+  // the user app: it lives in the separate ads admin console (apps/ads-admin), which talks to
+  // /admin/ads/* directly. The admin dialog only links there (AdminStats.ads_admin_url).
+}

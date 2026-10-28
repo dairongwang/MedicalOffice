@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / Angular
+node_modules/
+dist/
+.angular/
+out-tsc/
+npm-debug.log*
+
+# Data & local services
+data/
+*.db
+*.db-*
+.pgdata/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDEs & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
