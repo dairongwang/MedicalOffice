@@ -1,9 +1,11 @@
 import { Component, computed, inject, signal, viewChild } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { Router } from '@angular/router';
 import { TasksService } from '../data/tasks.service';
 import { MembershipService } from '../membership/membership.service';
 import { SyncService } from '../sync/sync.service';
 import { DialogDirective } from '../ui/dialog.directive';
+import { PasswordToggleDirective } from '../ui/password-toggle.directive';
 import { TipDirective } from '../ui/tip.directive';
 import { ToastService } from '../ui/toast.service';
 import { relative } from '../update/update-policy';
@@ -57,7 +59,7 @@ const FALLBACK_PLANS: PlanInfo[] = [
 
 @Component({
   selector: 'app-account-dialog',
-  imports: [FormsModule, DialogDirective, TipDirective, TwoFactorPanel],
+  imports: [FormsModule, DialogDirective, PasswordToggleDirective, TipDirective, TwoFactorPanel],
   template: `
     <dialog
       appDialog
@@ -102,6 +104,7 @@ const FALLBACK_PLANS: PlanInfo[] = [
               id="acc-passphrase"
               name="passphrase"
               type="password"
+              appPasswordToggle
               [(ngModel)]="passphrase"
               required
               minlength="8"
@@ -117,6 +120,7 @@ const FALLBACK_PLANS: PlanInfo[] = [
                 id="acc-passphrase2"
                 name="passphrase2"
                 type="password"
+                appPasswordToggle
                 [(ngModel)]="passphrase2"
                 required
                 minlength="8"
@@ -242,25 +246,19 @@ const FALLBACK_PLANS: PlanInfo[] = [
             </button>
           </div>
         } @else if (!account.signedIn()) {
-          <p class="muted small">
-            You don't need an account — everything already works on this device. An account adds
-            end-to-end-encrypted sync between your devices (Pro). Your password never leaves this
-            device; the server only stores an encrypted copy of your data that it cannot read.
+          <p class="muted small" id="acc-patient-hint">
+            @if (mode() === 'register') {
+              A <strong>patient account</strong> lets you see your own appointments, cancel them and
+              book new ones without typing your details each time. Registering is optional — booking
+              works without an account. Staff and administrators sign in on the staff and office
+              dashboards, not here.
+            } @else {
+              Sign in to your <strong>patient account</strong> to see your appointments. Staff and
+              administrators sign in on the staff and office dashboards, not here.
+            }
+            Your password never leaves this device; the server only stores an encrypted copy of your
+            data that it cannot read.
           </p>
-          <div class="update-summary membership-table" id="membership-table">
-            <div>
-              <span class="muted">Free (with or without account)</span>
-              <strong>{{ freeLimitLabel() }}</strong>
-              <span class="small">{{ tasks.usageLabel() }} on this device</span>
-            </div>
-            <div>
-              <span class="muted">Pro</span>
-              <strong>Unlimited active tasks</strong>
-              <span class="small"
-                >+ encrypted sync & backup across devices · no sponsored content</span
-              >
-            </div>
-          </div>
           <div class="field">
             <label for="acc-email">E-mail</label>
             <input
@@ -281,6 +279,7 @@ const FALLBACK_PLANS: PlanInfo[] = [
               id="acc-password"
               name="password"
               type="password"
+              appPasswordToggle
               [(ngModel)]="password"
               required
               minlength="8"
@@ -363,8 +362,10 @@ const FALLBACK_PLANS: PlanInfo[] = [
               ><strong id="account-billing">{{ billingLabel() }}</strong>
             </div>
             <div>
-              <span class="muted">Active tasks</span
-              ><span id="account-task-usage">{{ tasks.usageLabel() }}</span>
+              <span class="muted">Account type</span
+              ><span id="account-role">{{
+                account.me()?.role === 'patient' ? 'Patient' : (account.me()?.role ?? '–')
+              }}</span>
             </div>
             <div>
               <span class="muted">Sync</span><span>{{ syncLabel() }}</span>
@@ -660,6 +661,7 @@ export class AccountDialog {
   readonly account = inject(AccountService);
   readonly membership = inject(MembershipService);
   readonly tasks = inject(TasksService);
+  private readonly router = inject(Router);
   readonly sync = inject(SyncService);
   private readonly toast = inject(ToastService);
   readonly dialog = viewChild.required(DialogDirective);
@@ -955,8 +957,14 @@ export class AccountDialog {
         return; // the dialog now shows the code step
       }
       this.password = '';
-      this.toast.show(this.mode() === 'register' ? 'Account created' : 'Signed in');
-      void this.loadMethods(); // the dialog stays open and now shows the account view
+      this.toast.show(this.mode() === 'register' ? 'Patient account created' : 'Signed in');
+      void this.loadMethods();
+      // Close the dialog. The patient pages react to the sign-in themselves (the registration
+      // tab shows "My details", the scheduler its payment check …); from anywhere else — the
+      // appointment link page, say — a patient signs in to see their appointments.
+      this.dialog().close();
+      if (!this.router.url.startsWith('/patients'))
+        void this.router.navigateByUrl('/patients/mine');
       // Existing local data is adopted by the first sync run (SyncService), not here.
     } catch (e) {
       this.error.set(e instanceof Error ? e.message : String(e));

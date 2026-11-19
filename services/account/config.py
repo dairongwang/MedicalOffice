@@ -110,7 +110,7 @@ if ENV in ("staging", "prod") and not os.environ.get("TOKEN_SECRET"):
 # gets a short-lived challenge to answer with a code; after this many wrong codes within the
 # window the account's second factor is locked for the rest of the window (6-digit codes must
 # not be guessable by looping).
-TWO_FACTOR_ISSUER = os.environ.get("TWO_FACTOR_ISSUER", "Personal Assistant").strip() or "Personal Assistant"
+TWO_FACTOR_ISSUER = os.environ.get("TWO_FACTOR_ISSUER", "Medic Office").strip() or "Medic Office"
 TWO_FACTOR_CHALLENGE_TTL_SECONDS = int(os.environ.get("TWO_FACTOR_CHALLENGE_TTL_SECONDS", "300"))
 TWO_FACTOR_MAX_FAILURES = int(os.environ.get("TWO_FACTOR_MAX_FAILURES", "5"))
 TWO_FACTOR_FAILURE_WINDOW_SECONDS = int(os.environ.get("TWO_FACTOR_FAILURE_WINDOW_SECONDS", "300"))
@@ -132,7 +132,7 @@ TWO_FACTOR_SEND_WINDOW_SECONDS = int(os.environ.get("TWO_FACTOR_SEND_WINDOW_SECO
 # deployment reachable from outside has to opt in explicitly (MESSAGING_FAKE_PROVIDERS=true).
 MESSAGING_FAKE_PROVIDERS = _bool(os.environ.get("MESSAGING_FAKE_PROVIDERS"), ENV in ("dev", "test")) and not IS_PROD
 # E-mail via SMTP (any provider: your mail server, SendGrid, Mailgun, Amazon SES, Microsoft 365 …).
-EMAIL_FROM = os.environ.get("EMAIL_FROM", "Personal Assistant <no-reply@localhost>").strip()
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "Medic Office <no-reply@localhost>").strip()
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "").strip()
@@ -207,6 +207,18 @@ BILLING_PROVIDER = os.environ.get("BILLING_PROVIDER", "stripe").strip().lower() 
 # the REST calls and the signed webhooks all work, so every billing state can be exercised
 # locally. On outside prod, never in prod.
 BILLING_FAKE_PROVIDERS = _bool(os.environ.get("BILLING_FAKE_PROVIDERS"), True) and not IS_PROD
+# Patients' payment methods (patient_payment_methods.py): each one is validated by authorizing
+# this small amount against the vault token and releasing it at once — nothing is charged. A
+# method is not usable ("active") until that succeeded; it runs when the method is added or its
+# detail changes (PAYMENT_VALIDATE_ON_SAVE), and on demand from the dashboards.
+PAYMENT_VALIDATION_AMOUNT_CENTS = int(os.environ.get("PAYMENT_VALIDATION_AMOUNT_CENTS", "100"))
+PAYMENT_VALIDATE_ON_SAVE = _bool(os.environ.get("PAYMENT_VALIDATE_ON_SAVE"), True)
+# Booking (patient_payments.py): a patient needs a validated ("active") payment method on their
+# account to book — the copay the coverage check named (or the self-pay visit fee below) is put
+# on hold on the default method when the visit is booked, charged when the office marks the
+# visit completed and released when it is canceled.
+APPOINTMENT_REQUIRE_PAYMENT_METHOD = _bool(os.environ.get("APPOINTMENT_REQUIRE_PAYMENT_METHOD"), True)
+SELF_PAY_VISIT_CENTS = int(os.environ.get("SELF_PAY_VISIT_CENTS", "15000"))
 TRIAL_DAYS = int(os.environ.get("TRIAL_DAYS", "14"))
 GRACE_DAYS = int(os.environ.get("GRACE_DAYS", "7"))
 # ---- Prices (what each paid membership costs) ----------------------------------------
@@ -319,6 +331,91 @@ ADS_NETWORK_PRIVACY_URL = os.environ.get("ADS_NETWORK_PRIVACY_URL", "").strip()
 # (Cloudflare: "CF-IPCountry"). Used only when the client sends *no* region at all (never when
 # the user chose "no region"), never stored. Empty (default) = never look at the IP-derived country.
 ADS_REGION_HEADER = os.environ.get("ADS_REGION_HEADER", "").strip()
+
+# ---- Staff dashboard (apps/staff) ----------------------------------------------------
+# The staff dashboard (job applications, onboarding, roster, availability) is a separate static
+# front-end with its own deployment. STAFF_DIST = serve it from this process at /staff/ (single-
+# process setups); STAFF_URL = where the main app should link to (default: /staff/ when served
+# here, otherwise empty = no link).
+STAFF_DIST = Path(os.environ["STAFF_DIST"]).resolve() if os.environ.get("STAFF_DIST") else None
+STAFF_URL = os.environ.get("STAFF_URL", "/staff/" if STAFF_DIST else "").strip()
+# ---- Office administration dashboard (apps/admin) ------------------------------------
+# Patients roster + appointment agenda for administrators: another separate static front-end
+# with its own deployment. ADMIN_DASHBOARD_DIST = serve it from this process at /admin/;
+# ADMIN_DASHBOARD_URL = where the main app links to (default /admin/ when served here).
+ADMIN_DASHBOARD_DIST = (
+    Path(os.environ["ADMIN_DASHBOARD_DIST"]).resolve() if os.environ.get("ADMIN_DASHBOARD_DIST") else None
+)
+ADMIN_DASHBOARD_URL = os.environ.get("ADMIN_DASHBOARD_URL", "/admin/" if ADMIN_DASHBOARD_DIST else "").strip()
+# Minimum age to be hired (hiring.py age check).
+MIN_HIRING_AGE = int(os.environ.get("MIN_HIRING_AGE", "18"))
+# Onboarding portal (portal.py): how long an invite link stays valid, and the e-signature
+# provider. "fake" (default outside prod) records signatures locally and returns a FAKE-ESIGN
+# reference; anything else is a stub until an adapter + credentials exist (esign.py).
+ONBOARDING_INVITE_TTL_HOURS = int(os.environ.get("ONBOARDING_INVITE_TTL_HOURS", "72"))
+ESIGN_PROVIDER = os.environ.get("ESIGN_PROVIDER", "" if IS_PROD else "fake").strip().lower()
+
+# ---- Insurance verification (insurance_verification.py) ------------------------------
+# Eligibility & benefits check of what a patient entered in the Insurance section: coverage and
+# effective dates, copay, deductible status, coinsurance, referral and prior-authorization
+# requirements. "fake" (default outside prod) answers deterministically from the member id —
+# see the module docstring for the magic words; anything else is a stub until a clearinghouse
+# adapter + credentials exist. Runs at registration (INSURANCE_VERIFY_ON_REGISTRATION) and on
+# demand from the office administration dashboard.
+INSURANCE_VERIFIER = os.environ.get("INSURANCE_VERIFIER", "" if IS_PROD else "fake").strip().lower()
+INSURANCE_VERIFY_ON_REGISTRATION = _bool(os.environ.get("INSURANCE_VERIFY_ON_REGISTRATION"), True)
+# A patient updating their own record by one-time code (patient_updates.py): how long the editing
+# session stays open after the code was confirmed.
+PATIENT_EDIT_TTL_SECONDS = int(os.environ.get("PATIENT_EDIT_TTL_SECONDS", str(30 * 60)))
+# Booking (appointments.py): the patient's coverage is checked for the day of the visit; without
+# active coverage the patient has to agree to pay for the visit themselves, or the appointment is
+# not made. A check made within COVERAGE_REUSE_SECONDS is reused instead of asking the insurer again.
+APPOINTMENT_REQUIRE_COVERAGE = _bool(os.environ.get("APPOINTMENT_REQUIRE_COVERAGE"), True)
+COVERAGE_REUSE_SECONDS = int(os.environ.get("COVERAGE_REUSE_SECONDS", "900"))
+
+# ---- Appointments (appointments.py) --------------------------------------------------
+# Patients book time slots with a provider (doctor, nurse, physician assistant) inside the
+# provider's weekly availability. Slots are this long, may be booked this many days ahead, and
+# are computed in the office's time zone (IANA name, e.g. "America/New_York"; the availability
+# hours 9–5 are office-local). Default UTC so that a fresh checkout behaves the same everywhere.
+APPOINTMENT_SLOT_MINUTES = int(os.environ.get("APPOINTMENT_SLOT_MINUTES", "30"))
+APPOINTMENT_MAX_DAYS_AHEAD = int(os.environ.get("APPOINTMENT_MAX_DAYS_AHEAD", "90"))
+OFFICE_TIMEZONE = os.environ.get("OFFICE_TIMEZONE", "UTC").strip() or "UTC"
+# Shown in the appointment messages and calendar entries (the address becomes the event's location).
+OFFICE_NAME = os.environ.get("OFFICE_NAME", "Medic Office").strip() or "Medic Office"
+OFFICE_ADDRESS = os.environ.get("OFFICE_ADDRESS", "").strip()
+OFFICE_PHONE = os.environ.get("OFFICE_PHONE", "").strip()  # e.g. "+1 555 010 0000" (dummy) — for the messages
+# Reminders (reminders.py): one message per appointment, this many hours before it starts, by
+# e-mail and/or text to what is on the patient record (the built-in fake outbox without SMTP /
+# Twilio). The job runs inside the API every REMINDER_CHECK_SECONDS (0 = off; off in tests —
+# they call it directly). Appointments booked less than REMINDER_MIN_AGE_MINUTES ago are not
+# reminded (the booking message just went out). Outside prod the job can be run "as of" a
+# future moment from the office administration dashboard to test it without waiting a day.
+REMINDER_HOURS_BEFORE = float(os.environ.get("REMINDER_HOURS_BEFORE", "24"))
+REMINDER_CHECK_SECONDS = int(os.environ.get("REMINDER_CHECK_SECONDS", "0" if ENV == "test" else "60"))
+REMINDER_MIN_AGE_MINUTES = int(os.environ.get("REMINDER_MIN_AGE_MINUTES", "60"))
+# Check-in (appointments.check_in): the patient checks in from the app — their account, the
+# appointment link or the lookup page — from this many hours before the visit until it ends.
+# Outside that window (or for a patient without the app) the office checks them in from the
+# office administration dashboard, at any time while the visit is scheduled.
+CHECK_IN_WINDOW_HOURS = float(os.environ.get("CHECK_IN_WINDOW_HOURS", "24"))
+# The check-in page (check_ins.py): questionnaire + signature, the estimated cost not covered by
+# insurance + the financial-responsibility signature. A page opened by the patient, or a link the
+# office sent to the patient, must be completed within this many minutes, or the check-in fails.
+CHECK_IN_LINK_MINUTES = int(os.environ.get("CHECK_IN_LINK_MINUTES", "60"))
+# What an office visit costs before insurance (the basis of the estimate when the plan names no
+# copay: deductible first, then coinsurance). A self-pay visit costs SELF_PAY_VISIT_CENTS.
+VISIT_ALLOWED_CENTS = int(os.environ.get("VISIT_ALLOWED_CENTS", os.environ.get("SELF_PAY_VISIT_CENTS", "15000")))
+
+# ---- Medical assistants (assignments.py) ----------------------------------------------
+# The office assigns a medical assistant (worker role "medical_assistant") to an appointment; the
+# assistant takes the task and completes it — not earlier than this many hours before the visit
+# starts (nobody rooms a patient for next week) — or reports they cannot do it.
+ASSISTANT_TASK_WINDOW_HOURS = float(os.environ.get("ASSISTANT_TASK_WINDOW_HOURS", "24"))
+# Where the office is told that an assistant reported they cannot do a task (besides the warning on
+# the office administration dashboard): an e-mail address / a phone number. Empty = dashboard only.
+OFFICE_NOTIFY_EMAIL = os.environ.get("OFFICE_NOTIFY_EMAIL", "").strip()
+OFFICE_NOTIFY_PHONE = os.environ.get("OFFICE_NOTIFY_PHONE", "").strip()
 
 # ---- API docs ------------------------------------------------------------------------
 # /api/docs, /api/redoc and /api/openapi.json need an administrator account whenever

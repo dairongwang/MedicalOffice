@@ -46,12 +46,13 @@ export class ApiService {
     method: string,
     path: string,
     body?: unknown,
-    opts: { auth?: boolean } = {},
+    opts: { auth?: boolean; headers?: Record<string, string> } = {},
   ): Promise<T> {
     const headers: Record<string, string> = {
       'X-Client-Version': RELEASE.version,
       'X-Schema-Version': String(RELEASE.schemaVersion),
       Accept: 'application/json',
+      ...(opts.headers ?? {}),
     };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     const token = this.token();
@@ -83,14 +84,18 @@ export class ApiService {
     return data as T;
   }
 
-  get<T>(path: string, opts?: { auth?: boolean }) {
+  get<T>(path: string, opts?: { auth?: boolean; headers?: Record<string, string> }) {
     return this.request<T>('GET', path, undefined, opts);
   }
-  post<T>(path: string, body?: unknown, opts?: { auth?: boolean }) {
+  post<T>(
+    path: string,
+    body?: unknown,
+    opts?: { auth?: boolean; headers?: Record<string, string> },
+  ) {
     return this.request<T>('POST', path, body ?? {}, opts);
   }
-  put<T>(path: string, body: unknown) {
-    return this.request<T>('PUT', path, body);
+  put<T>(path: string, body: unknown, opts?: { auth?: boolean; headers?: Record<string, string> }) {
+    return this.request<T>('PUT', path, body, opts);
   }
   patch<T>(path: string, body: unknown) {
     return this.request<T>('PATCH', path, body);

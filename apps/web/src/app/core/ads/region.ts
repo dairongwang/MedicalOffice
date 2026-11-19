@@ -1,97 +1,89 @@
-import { COUNTRY_CODES, ZONE_COUNTRY } from './zone-country';
-
 /**
- * Coarse region detection — on the device, from what the browser already knows.
- *
- * The sponsored-content panel picks creatives by *country*, nothing finer. The country is
- * derived here from the IANA time zone the browser reports (`Europe/Berlin` → `DE`) or, failing
- * that, from the locale's region subtag (`en-GB` → `GB`). No geolocation API, no IP lookup, no
- * permission prompt; the inputs never leave the device — only the resulting two-letter code is
- * sent with the ad request, and the user can see, override or switch it off (AdsService).
+ * Coarse region for contextual sponsored content — derived *on the device*, never from the
+ * network address. The result is an ISO 3166-1 alpha-2 country code, "ZZ" (no region) or
+ * null (nothing could be derived). The user sees and can override it (AdInfoDialog).
  */
 
-export type RegionSource = 'timezone' | 'language' | 'manual' | 'none';
-
-export interface DetectedRegion {
-  /** ISO 3166-1 alpha-2, or null when nothing sensible could be derived (UTC, odd locales). */
-  region: string | null;
-  source: RegionSource;
-}
-
-/** "Unknown / no region" (ISO 3166-1 user-assigned code) — what the client sends when the user opted out. */
-export const NO_REGION = 'ZZ';
-
-const ALPHA2 = /^[A-Z]{2}$/;
-
-export function isCountryCode(value: string | null | undefined): value is string {
-  return !!value && ALPHA2.test(value) && value !== NO_REGION;
-}
-
-/** Country of an IANA zone name, or null (`UTC`, `Etc/GMT+2`, unknown names). */
-export function countryOfTimeZone(zone: string | null | undefined): string | null {
-  if (!zone) return null;
-  return ZONE_COUNTRY[zone] ?? null;
-}
-
-/** Region subtag of a BCP 47 tag (`de-AT` → `AT`, `zh-Hant-TW` → `TW`, `en` → null). */
-export function countryOfLocale(tag: string | null | undefined): string | null {
-  if (!tag) return null;
-  for (const part of tag.split(/[-_]/).slice(1)) {
-    const upper = part.toUpperCase();
-    if (ALPHA2.test(upper)) return upper;
-  }
-  return null;
-}
-
-/** Primary language subtag (`de-CH` → `de`), or null. */
-export function primaryLanguage(tag: string | null | undefined): string | null {
-  const primary = (tag ?? '').split(/[-_]/)[0]?.toLowerCase() ?? '';
-  return /^[a-z]{2,3}$/.test(primary) ? primary : null;
-}
-
-export function detectRegion(
-  input: { timeZone?: string | null; language?: string | null } = browserHints(),
-): DetectedRegion {
-  const fromZone = countryOfTimeZone(input.timeZone);
-  if (fromZone) return { region: fromZone, source: 'timezone' };
-  const fromLocale = countryOfLocale(input.language);
-  if (fromLocale) return { region: fromLocale, source: 'language' };
-  return { region: null, source: 'none' };
-}
-
-export function browserHints(): { timeZone: string | null; language: string | null } {
-  let timeZone: string | null = null;
+/** Region subtag of a BCP 47 locale: "de-AT" → "AT", "en" → null. */
+export function regionFromLocale(locale: string | undefined | null): string | null {
+  if (!locale) return null;
   try {
-    timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone ?? null;
+    const region = new Intl.Locale(locale).region;
+    return region && /^[A-Z]{2}$/.test(region) ? region : null;
   } catch {
-    /* very old engines */
+    const m = /[-_]([A-Za-z]{2})(?:[-_]|$)/.exec(locale);
+    return m ? m[1].toUpperCase() : null;
   }
-  return { timeZone, language: typeof navigator !== 'undefined' ? navigator.language : null };
 }
 
-/** Human name for a country code in the UI language ("DE" → "Germany"), falling back to the code. */
-export function countryName(code: string, locale?: string): string {
+/** A few time zones map unambiguously to a country (used when the locale has no region). */
+const TZ_COUNTRY: Record<string, string> = {
+  'Europe/Berlin': 'DE',
+  'Europe/Vienna': 'AT',
+  'Europe/Zurich': 'CH',
+  'Europe/Paris': 'FR',
+  'Europe/Madrid': 'ES',
+  'Europe/Rome': 'IT',
+  'Europe/Amsterdam': 'NL',
+  'Europe/Brussels': 'BE',
+  'Europe/Lisbon': 'PT',
+  'Europe/Dublin': 'IE',
+  'Europe/London': 'GB',
+  'Europe/Stockholm': 'SE',
+  'Europe/Oslo': 'NO',
+  'Europe/Copenhagen': 'DK',
+  'Europe/Helsinki': 'FI',
+  'Europe/Warsaw': 'PL',
+  'Europe/Prague': 'CZ',
+  'Europe/Budapest': 'HU',
+  'Europe/Athens': 'GR',
+  'Europe/Istanbul': 'TR',
+  'Asia/Tokyo': 'JP',
+  'Asia/Seoul': 'KR',
+  'Asia/Singapore': 'SG',
+  'Asia/Kolkata': 'IN',
+  'Asia/Dubai': 'AE',
+  'Australia/Sydney': 'AU',
+  'Australia/Melbourne': 'AU',
+  'Pacific/Auckland': 'NZ',
+  'America/Toronto': 'CA',
+  'America/Vancouver': 'CA',
+  'America/Mexico_City': 'MX',
+  'America/Sao_Paulo': 'BR',
+  'America/Argentina/Buenos_Aires': 'AR',
+  'Africa/Johannesburg': 'ZA',
+};
+
+/** US time zones share names with no other country. */
+const US_TZ =
+  /^America\/(New_York|Chicago|Denver|Los_Angeles|Phoenix|Anchorage|Detroit|Boise|Indiana)/;
+
+export function regionFromTimeZone(tz: string | undefined | null): string | null {
+  if (!tz) return null;
+  if (US_TZ.test(tz) || tz.startsWith('US/') || tz === 'Pacific/Honolulu') return 'US';
+  return TZ_COUNTRY[tz] ?? null;
+}
+
+/** Best local guess: locale region first, then the time zone. */
+export function detectRegion(): string | null {
+  const locales = [navigator.language, ...(navigator.languages ?? [])];
+  for (const l of locales) {
+    const r = regionFromLocale(l);
+    if (r) return r;
+  }
   try {
-    const names = new Intl.DisplayNames(locale ? [locale] : undefined, { type: 'region' });
-    return names.of(code) ?? code;
+    return regionFromTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone);
   } catch {
-    return code;
+    return null;
   }
 }
 
-/** Human name for a language code ("de" → "German"), falling back to the code. */
-export function languageName(code: string, locale?: string): string {
-  try {
-    const names = new Intl.DisplayNames(locale ? [locale] : undefined, { type: 'language' });
-    return names.of(code) ?? code;
-  } catch {
-    return code;
-  }
+/** Primary language subtag for the request ("de-AT" → "de"). */
+export function primaryLanguage(): string {
+  const l = navigator.language || 'en';
+  return l.split(/[-_]/)[0].toLowerCase();
 }
 
-/** All countries for the manual picker, sorted by display name. */
-export function countryOptions(locale?: string): { code: string; name: string }[] {
-  return COUNTRY_CODES.map((code) => ({ code, name: countryName(code, locale) })).sort((a, b) =>
-    a.name.localeCompare(b.name),
-  );
+export function isValidRegion(code: string | null | undefined): code is string {
+  return !!code && /^[A-Z]{2}$/.test(code);
 }

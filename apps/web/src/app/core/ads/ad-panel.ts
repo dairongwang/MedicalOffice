@@ -1,303 +1,298 @@
 import {
   Component,
-  DestroyRef,
   ElementRef,
   computed,
   effect,
   inject,
   output,
+  signal,
   viewChild,
 } from '@angular/core';
 import { TipDirective } from '../ui/tip.directive';
-import { AdEmbedComponent } from './ad-embed';
-import { type AdCreative, AdsService } from './ads.service';
-import { NO_REGION, countryName, languageName } from './region';
-
-const VIEWABLE_RATIO = 0.5; // IAB: at least half of the creative …
-const VIEWABLE_MS = 1000; // … in view for at least one second = one impression
+import { type AdCreative, type AdEmbed, AdsService } from './ads.service';
 
 /**
- * The sponsored-content panel: one small, clearly labelled card at the end of the sidebar.
+ * The sponsored-content card in the dashboard sidebar (free memberships only).
  *
- * Non-intrusive by construction: it is part of the normal page flow (never fixed, never an
- * overlay, never a modal), has no animation or sound, shows one text-first creative at a time,
- * can be folded to a one-line strip or hidden per creative, and its link opens in a new tab
- * without a referrer. It renders nothing at all for memberships with `ad_free`.
+ * Two render paths, decided by the server's active source:
+ *  - `creatives`: first-party cards (sponsor, headline, blurb, call to action) — no third party
+ *    is contacted; impressions/clicks are counted anonymously.
+ *  - `embed`: a third-party provider tag (AdSense, Microsoft, network). Its script is loaded
+ *    only after the user consented on this device; until then a consent card is shown.
  */
 @Component({
   selector: 'app-ad-panel',
-  imports: [TipDirective, AdEmbedComponent],
+  imports: [TipDirective],
   template: `
-    @if (ads.eligible() && (ads.current() || ads.embedMode() || ads.collapsed() || ads.large())) {
-      <aside
+    @if (ads.active() && source(); as src) {
+      <section
         class="card ad-panel"
-        id="ad-panel"
-        aria-labelledby="ad-label"
         [class.collapsed]="ads.collapsed()"
         [class.large]="ads.large()"
-        [attr.data-ad-id]="ads.current()?.id ?? null"
-        [attr.data-source]="ads.source()?.kind ?? null"
-        [attr.data-region]="ads.region() ?? ''"
-        [attr.data-lang]="ads.language() ?? ''"
+        id="ad-panel"
+        aria-label="Sponsored content"
+        [attr.data-source]="src.kind"
       >
         <div class="ad-head">
-          <span class="ad-badge" id="ad-label">{{ ads.badge() }}</span>
-          @if (ads.source()?.mode === 'fake') {
+          <span class="ad-badge">{{ src.label }}</span>
+          @if (src.mode === 'fake') {
             <span
               class="ad-fake"
-              id="ad-fake"
-              title="Built-in fake provider — nothing leaves this machine"
+              appTip="Built-in stand-in: no ad provider is configured on this server, nothing leaves the machine."
               >FAKE</span
             >
           }
-          @if (ads.current(); as ad) {
+          @if (!ads.collapsed() && current(); as ad) {
             <span class="ad-sponsor">{{ ad.sponsor }}</span>
-          } @else if (ads.embedMode()) {
-            <span class="ad-sponsor muted">{{ ads.source()?.provider_name }}</span>
-          } @else if (ads.collapsed()) {
-            <span class="ad-sponsor muted">hidden</span>
+          } @else if (!ads.collapsed() && src.third_party) {
+            <span class="ad-sponsor">{{ src.provider_name || src.title }}</span>
           } @else {
-            <span class="ad-sponsor muted">{{ ads.loading() ? 'loading…' : 'no message' }}</span>
+            <span class="ad-sponsor">Sponsored content</span>
           }
           <span class="ad-tools">
             <button
-              type="button"
               class="ad-tool"
+              type="button"
               id="ad-why"
               (click)="why.emit()"
-              appTip="Why am I seeing this? Shows what is used to pick sponsored content (only your country and language, chosen on this device), what is never used, and where to change or turn it off."
+              appTip="Why you see this, how it is chosen and what is (not) collected — and where to turn it off."
             >
               Why this?
             </button>
             <button
-              type="button"
               class="ad-tool"
-              id="ad-toggle"
+              type="button"
+              id="ad-collapse"
               (click)="ads.setCollapsed(!ads.collapsed())"
               [attr.aria-expanded]="!ads.collapsed()"
-              aria-controls="ad-body"
               [appTip]="
                 ads.collapsed()
-                  ? 'Show the sponsored message again.'
-                  : 'Fold the sponsored message away to a one-line strip. Nothing is requested while it is folded.'
+                  ? 'Show the sponsored content again.'
+                  : 'Fold the panel to a single line.'
               "
             >
               {{ ads.collapsed() ? 'Show' : 'Hide' }}
             </button>
           </span>
         </div>
+
         @if (!ads.collapsed()) {
-          <!-- Targeting, spelled out on the panel: the country + language creatives are picked for. -->
-          <p class="ad-target" id="ad-target">
-            <span class="ad-target-label">Shown for</span>
-            <mark class="ad-hl" id="ad-target-country">{{ countryLabel() }}</mark>
-            <span class="ad-plus">+</span>
-            <mark class="ad-hl" id="ad-target-lang">{{ languageLabel() }}</mark>
-            <span class="ad-target-source">{{ sourceLabel() }}</span>
-          </p>
-        }
-        @if (ads.embedMode() && !ads.collapsed() && ads.source(); as src) {
-          <div class="ad-body ad-body-embed" id="ad-embed">
-            <app-ad-embed [source]="src" />
-          </div>
-          @if (ads.large()) {
-            <p class="ad-debug muted small" id="ad-debug">
-              Source: {{ src.title }} ({{ src.mode }}) · rendered by the provider's script ·
-              reporting in the provider's console
-            </p>
+          @if (ads.large() && src.render === 'creatives') {
+            <div class="ad-target">
+              <span class="ad-target-label">Chosen for</span>
+              <span class="ad-hl">{{ regionLabel() }}</span>
+              <span class="ad-plus">+</span>
+              <span class="ad-hl">{{ languageLabel() }}</span>
+              <span class="ad-target-source">{{ regionSource() }}</span>
+            </div>
           }
-        } @else if (ads.current(); as ad) {
-          <div class="ad-body" id="ad-body" #creative>
-            <a
-              class="ad-link"
-              [href]="safeHref(ad)"
-              [attr.target]="isAppLink(ad) ? null : '_blank'"
-              rel="noopener noreferrer nofollow sponsored"
-              referrerpolicy="no-referrer"
-              (click)="onLinkClick($event, ad)"
-              [attr.aria-label]="
-                'Sponsored: ' + ad.headline + ' — ' + ad.sponsor + '. Opens in a new tab.'
-              "
-              appTip="Sponsored link. Opens the sponsor's page in a new tab; the sponsor is not told where you came from."
-            >
-              @if (ad.image_url) {
-                <img
-                  class="ad-img"
-                  [src]="ad.image_url"
-                  alt=""
-                  width="48"
-                  height="48"
-                  loading="lazy"
-                  decoding="async"
-                  referrerpolicy="no-referrer"
-                />
-              }
-              <span class="ad-text">
-                <span class="ad-headline">{{ ad.headline }}</span>
-                @if (ad.blurb) {
-                  <span class="ad-blurb">{{ ad.blurb }}</span>
-                }
-                <span class="ad-cta">{{ ad.cta_label }} {{ isAppLink(ad) ? '→' : '↗' }}</span>
-                @if (ads.source()?.disclosure; as disclosure) {
-                  <span
-                    class="ad-disclosure"
-                    id="ad-disclosure"
-                    [class.prominent]="ads.source()?.kind === 'affiliate'"
-                    >{{ disclosure }}</span
+
+          @if (src.render === 'creatives') {
+            @if (current(); as ad) {
+              <div class="ad-body">
+                <a
+                  class="ad-link"
+                  id="ad-link"
+                  [href]="ad.target_url === 'app:upgrade' ? '#' : ad.target_url"
+                  [attr.target]="ad.target_url === 'app:upgrade' ? null : '_blank'"
+                  rel="noopener noreferrer nofollow sponsored"
+                  (click)="onClick($event, ad)"
+                  appTip="Opens the sponsor's page in a new tab. Only an anonymous click count is recorded."
+                >
+                  @if (ad.image_url) {
+                    <img class="ad-img" [src]="ad.image_url" alt="" loading="lazy" />
+                  }
+                  <span class="ad-text">
+                    <span class="ad-headline">{{ ad.headline }}</span>
+                    @if (ad.blurb) {
+                      <span class="ad-blurb">{{ ad.blurb }}</span>
+                    }
+                    <span class="ad-cta">{{ ad.cta_label }} →</span>
+                    @if (src.disclosure) {
+                      <span class="ad-disclosure" [class.prominent]="src.kind === 'affiliate'">{{
+                        src.disclosure
+                      }}</span>
+                    }
+                  </span>
+                </a>
+                <button
+                  class="ad-dismiss"
+                  type="button"
+                  id="ad-dismiss"
+                  aria-label="Show another"
+                  (click)="ads.next()"
+                  appTip="Not interested — show the next one."
+                >
+                  ✕
+                </button>
+              </div>
+            } @else {
+              <div class="ad-empty">
+                <span>No sponsored content for your region and language right now.</span>
+                @if (ads.large()) {
+                  <span class="small muted"
+                    >Region <code>{{ regionLabel() }}</code> · language
+                    <code>{{ languageLabel() }}</code></span
                   >
                 }
-              </span>
-            </a>
-            <button
-              type="button"
-              class="ad-dismiss"
-              id="ad-dismiss"
-              (click)="ads.dismiss(ad)"
-              aria-label="Hide this ad for a week"
-              appTip="Hide this particular message on this device for a week."
-            >
-              ✕
-            </button>
-          </div>
-          @if (ads.large()) {
-            <p class="ad-debug muted small" id="ad-debug">
-              Source: {{ ads.source()?.title }} ({{ ads.source()?.mode }}) · campaign
-              {{ ads.visible().indexOf(ad) + 1 }} of {{ ads.visible().length }} for this context ·
-              this session: {{ ads.stats().impressions }} view{{
-                ads.stats().impressions === 1 ? '' : 's'
-              }}
-              · {{ ads.stats().clicks }} click{{ ads.stats().clicks === 1 ? '' : 's' }} counted
-              (anonymous)
-            </p>
-          }
-        } @else if (ads.large() && !ads.collapsed()) {
-          <!-- Showcase layout only: say why the panel is empty instead of vanishing. -->
-          <p class="ad-empty" id="ad-empty">
-            @if (!ads.online()) {
-              Offline — sponsored content is only requested while online.
-            } @else if (ads.loading()) {
-              Loading sponsored content…
-            } @else if (ads.lastError()) {
-              The sponsored-content service did not answer ({{ ads.lastError() }}).
-            } @else if (ads.source()?.mode === 'unavailable') {
-              The configured ad source ({{ ads.source()?.title }}) is not set up on the server.
-            } @else {
-              No {{ ads.source()?.title?.toLowerCase() ?? 'campaign' }} for {{ countryLabel() }} +
-              {{ languageLabel() }} right now.
-              <span class="muted"
-                >Developers: <code>python dev.py seed --ads</code> creates dummy campaigns.</span
-              >
+              </div>
             }
-          </p>
+          } @else {
+            <div class="ad-body-embed">
+              @if (!ads.consent()) {
+                <div class="ad-consent" id="ad-consent">
+                  <span>
+                    This space is filled by <strong>{{ src.provider_name || src.title }}</strong
+                    >, a third party. Loading it sends your IP address and browser details to that
+                    provider, which may use cookies to personalise what you see.
+                  </span>
+                  @if (src.privacy_url) {
+                    <a [href]="src.privacy_url" target="_blank" rel="noopener noreferrer"
+                      >Provider's privacy policy ↗</a
+                    >
+                  }
+                  <span class="ad-consent-actions">
+                    <button
+                      class="btn primary"
+                      type="button"
+                      id="ad-consent-accept"
+                      (click)="ads.setConsent(true)"
+                      appTip="Allow the provider's script on this device. You can withdraw this any time under 'Why this?'."
+                    >
+                      Allow
+                    </button>
+                    <button
+                      class="btn"
+                      type="button"
+                      id="ad-consent-upgrade"
+                      (click)="upgrade.emit()"
+                      appTip="Pro memberships have no sponsored content at all."
+                    >
+                      Go ad-free
+                    </button>
+                  </span>
+                </div>
+              } @else {
+                <div #slot class="ad-slot" id="ad-slot"></div>
+                <div class="ad-slot-status muted">
+                  @if (embedError()) {
+                    {{ embedError() }}
+                  } @else if (!embedLoaded()) {
+                    Loading {{ src.provider_name || src.title }}…
+                  }
+                </div>
+              }
+            </div>
+          }
         }
-      </aside>
+      </section>
     }
   `,
 })
 export class AdPanel {
   readonly ads = inject(AdsService);
-  /** "Why this?" — the shell opens the explanation dialog. */
+  /** "Why this?" — the app opens the sponsored-content info dialog. */
   readonly why = output<void>();
-  /** An internal (house) ad linking into the app — the shell opens the account screen. */
+  /** The user wants to go ad-free (house ad / consent card) — the app opens the account screen. */
   readonly upgrade = output<void>();
 
-  private readonly creative = viewChild<ElementRef<HTMLElement>>('creative');
-  private observer: IntersectionObserver | null = null;
-  private timer: ReturnType<typeof setTimeout> | null = null;
-  private watching: AdCreative | null = null;
+  readonly source = this.ads.source;
+  readonly current = this.ads.current;
+  readonly slot = viewChild<ElementRef<HTMLElement>>('slot');
+  readonly embedLoaded = signal(false);
+  readonly embedError = signal<string | null>(null);
+
+  readonly regionLabel = computed(() => {
+    const r = this.ads.response()?.region ?? this.ads.region();
+    if (!r || r === 'ZZ') return 'no region';
+    try {
+      return new Intl.DisplayNames([navigator.language], { type: 'region' }).of(r) ?? r;
+    } catch {
+      return r;
+    }
+  });
+  readonly languageLabel = computed(() => {
+    try {
+      return (
+        new Intl.DisplayNames([navigator.language], { type: 'language' }).of(this.ads.language) ??
+        this.ads.language
+      );
+    } catch {
+      return this.ads.language;
+    }
+  });
+  readonly regionSource = computed(() => {
+    switch (this.ads.regionMode()) {
+      case 'manual':
+        return 'Region chosen by you (Why this? → Region).';
+      case 'off':
+        return 'No region is sent — you turned it off.';
+      default:
+        return 'Region derived on this device from your language and time zone; never from your IP address.';
+    }
+  });
+
+  private embeddedFor: string | null = null;
 
   constructor() {
-    // Viewability: start a 1 s timer when ≥50 % of the creative is on screen; count the
-    // impression if it is still there when the timer fires. Re-armed for every new creative.
+    // Count an impression once per creative shown.
     effect(() => {
-      const ad = this.ads.current();
-      const el = this.creative()?.nativeElement ?? null;
-      this.unwatch();
-      if (ad && el) this.watch(ad, el);
+      const ad = this.current();
+      if (ad && this.ads.active() && !this.ads.collapsed()) this.ads.impression(ad);
     });
-    inject(DestroyRef).onDestroy(() => this.unwatch());
-  }
-
-  /** "Germany (DE)" · "no region (ZZ)" · "unknown region". */
-  readonly countryLabel = computed(() => {
-    const r = this.ads.region();
-    if (!r) return 'unknown region';
-    if (r === NO_REGION) return 'no region (ZZ)';
-    return `${countryName(r)} (${r})`;
-  });
-  /** "German (de)" · "any language". */
-  readonly languageLabel = computed(() => {
-    const l = this.ads.language();
-    return l ? `${languageName(l)} (${l})` : 'any language';
-  });
-  readonly sourceLabel = computed(() => {
-    switch (this.ads.effectiveMode()) {
-      case 'manual':
-        return 'country chosen by you';
-      case 'off':
-        return 'region switched off';
-      default: {
-        const d = this.ads.detected();
-        return d.source === 'timezone'
-          ? 'from this device’s time zone'
-          : d.source === 'language'
-            ? 'from this device’s language'
-            : 'nothing could be derived on this device';
+    // Third-party embed: mount the provider tag once the slot exists and consent was given.
+    effect(() => {
+      const src = this.source();
+      const slot = this.slot()?.nativeElement;
+      const consent = this.ads.consent();
+      if (!src || src.render !== 'embed' || !src.embed || !slot || !consent) {
+        this.embeddedFor = null;
+        return;
       }
-    }
-  });
+      const key = src.embed.script_url + '|' + JSON.stringify(src.embed.container_attrs);
+      if (this.embeddedFor === key) return;
+      this.embeddedFor = key;
+      this.mountEmbed(slot, src.embed);
+    });
+  }
 
-  /** Internal ads may link into the app ("app:upgrade"); everything else is https (server-enforced). */
-  isAppLink(ad: AdCreative): boolean {
-    return ad.target_url.startsWith('app:');
-  }
-  safeHref(ad: AdCreative): string {
-    if (this.isAppLink(ad)) return '#';
-    return /^https:\/\//i.test(ad.target_url) ? ad.target_url : '#';
-  }
-  onLinkClick(ev: MouseEvent, ad: AdCreative) {
+  onClick(event: MouseEvent, ad: AdCreative): void {
     this.ads.click(ad);
-    if (this.isAppLink(ad)) {
-      ev.preventDefault();
-      if (ad.target_url === 'app:upgrade') this.upgrade.emit();
+    if (ad.target_url === 'app:upgrade') {
+      event.preventDefault();
+      this.upgrade.emit();
     }
   }
 
-  private watch(ad: AdCreative, el: HTMLElement) {
-    this.watching = ad;
-    if (typeof IntersectionObserver === 'undefined') {
-      // No observer (very old engine / test DOM): count after the dwell time if the tab is visible.
-      this.arm(ad);
-      return;
-    }
-    this.observer = new IntersectionObserver(
-      (entries) => {
-        const e = entries[0];
-        if (e && e.isIntersecting && e.intersectionRatio >= VIEWABLE_RATIO) this.arm(ad);
-        else this.disarm();
-      },
-      { threshold: [0, VIEWABLE_RATIO, 1] },
-    );
-    this.observer.observe(el);
-  }
+  private mountEmbed(slot: HTMLElement, embed: AdEmbed): void {
+    this.embedLoaded.set(false);
+    this.embedError.set(null);
+    slot.replaceChildren();
+    const container = document.createElement(embed.container_tag || 'div');
+    if (embed.container_class) container.className = embed.container_class;
+    if (embed.container_style) container.setAttribute('style', embed.container_style);
+    for (const [k, v] of Object.entries(embed.container_attrs ?? {})) container.setAttribute(k, v);
+    slot.appendChild(container);
 
-  private arm(ad: AdCreative) {
-    if (this.timer) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      if (this.watching === ad && !document.hidden) this.ads.impression(ad);
-    }, VIEWABLE_MS);
-  }
-
-  private disarm() {
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
-  }
-
-  private unwatch() {
-    this.disarm();
-    this.observer?.disconnect();
-    this.observer = null;
-    this.watching = null;
+    const script = document.createElement('script');
+    script.async = true;
+    script.src = embed.script_url;
+    for (const [k, v] of Object.entries(embed.script_attrs ?? {})) script.setAttribute(k, v);
+    script.onload = () => {
+      this.embedLoaded.set(true);
+      if (embed.push_global) {
+        const w = window as unknown as Record<string, { push(x: object): unknown } | undefined>;
+        try {
+          (w[embed.push_global] ??= [] as unknown as { push(x: object): unknown }).push({});
+        } catch {
+          /* the provider's contract differs — nothing we can do */
+        }
+      }
+    };
+    script.onerror = () =>
+      this.embedError.set(
+        'The ad provider could not be loaded (blocked by the browser or offline).',
+      );
+    slot.appendChild(script);
   }
 }

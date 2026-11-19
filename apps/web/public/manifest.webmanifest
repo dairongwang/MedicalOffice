@@ -1,7 +1,7 @@
 {
-  "name": "Personal Assistant",
-  "short_name": "Assistant",
-  "description": "Tasks, events and a daily summary — on every device, data stays on your device.",
+  "name": "Medic Office management",
+  "short_name": "Medic Office",
+  "description": "Patient registration and appointment scheduling for the practice; staff roster and availability.",
   "id": "/",
   "start_url": "/",
   "scope": "/",
@@ -10,7 +10,7 @@
   "background_color": "#f5f6f8",
   "theme_color": "#4f46e5",
   "lang": "en",
-  "categories": ["productivity"],
+  "categories": ["medical", "productivity"],
   "icons": [
     { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },

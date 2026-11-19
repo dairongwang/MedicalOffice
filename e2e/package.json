@@ -1,0 +1,8 @@
+{
+  "name": "medic-office-e2e-browser",
+  "private": true,
+  "description": "Optional: a Chromium that arrives INSIDE an npm package (no separate download), for machines where Playwright's own browser download is blocked. `npm install` here, then `python dev.py e2e`.",
+  "devDependencies": {
+    "@sparticuz/chromium": "^141.0.0"
+  }
+}

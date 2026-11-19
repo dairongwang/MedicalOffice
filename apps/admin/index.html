@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Office administration — Medic Office management</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="Medic Office administration dashboard: the patient roster, the appointment agenda and the payment history." />
+    <meta name="theme-color" content="#1d4ed8" />
+    <meta name="robots" content="noindex" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231d4ed8'/%3E%3Cpath d='M18 22h28M18 32h28M18 42h18' stroke='%23fff' stroke-width='6' stroke-linecap='round'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="config.js"></script>
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">≡</span>
+        <div>
+          <h1>Office administration</h1>
+          <p class="muted small">Medic Office management</p>
+        </div>
+      </div>
+      <div id="account" class="account"></div>
+    </header>
+    <nav id="tabs" class="tabs" aria-label="Sections"></nav>
+    <main id="view" class="view"><p class="muted loading">Loading…</p></main>
+    <footer class="foot muted small">Office administration · API: <code id="api-origin"></code> · dummy data only in development</footer>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="js/app.js"></script>
+    <noscript>Please enable JavaScript to use the office administration dashboard.</noscript>
+  </body>
+</html>

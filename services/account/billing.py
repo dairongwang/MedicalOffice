@@ -484,8 +484,10 @@ def apply_webhook(db: Session, event: schemas.PaymentEvent, provider_name: str) 
     elif event.type == "payment_failed":
         if event.payment:
             record_payment(db, account, provider_name, event.payment, failed=True)
-        if sub.plan == "pro" and sub.status in ("active", "trialing", "past_due"):
-            sub.status = "past_due"  # grace period; a failed one-off (Lifetime) grants nothing
+        # Grace period for a failed subscription charge. A failed one-off (Lifetime) purchase grants
+        # nothing — and must not push a running Pro subscription / trial into past_due either.
+        if event.plan != "lifetime" and sub.plan == "pro" and sub.status in ("active", "trialing", "past_due"):
+            sub.status = "past_due"
     elif event.type == "payment.refunded" and event.payment:
         row = (
             db.query(models.Payment)

@@ -1,2 +1,5 @@
+# End-to-end tests (python dev.py e2e): pytest + Playwright. The browser itself comes from
+# `python -m playwright install chromium`, or — when that download is not possible — from the
+# npm package @sparticuz/chromium (see package.json / README "Testing → End-to-end").
 pytest==9.1.1
 playwright==1.56.0

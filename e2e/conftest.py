@@ -1,11 +1,19 @@
-"""End-to-end tests: real Chromium (Playwright), real service worker, real API.
+"""End-to-end tests (``python dev.py e2e``): a real browser against an isolated stack.
 
-    python dev.py e2e            # builds the PWA, starts the API on a free port, runs these
+The session starts, on free ports:
 
-The API uses a temporary SQLite database here (the service's own pytest suite covers
-PostgreSQL); the PWA is served by the API from apps/web/dist so the service worker is active
-(it only runs on localhost or HTTPS). "Deploying a release" = rebuilding into dist + publishing
-the manifest — exactly what the Azure pipeline does with the CDN.
+    the API          a throw-away SQLite database in a temporary folder, APP_ENV=test, the dummy data
+                     (SEED_FAKE_ACCOUNTS=true), the built-in fakes for e-mail / SMS / payments; it also serves
+                     the patients' app (apps/web production build — built once if missing)
+    the staff dashboard                  apps/staff/serve.py, pointed at that API
+    the office administration dashboard  apps/admin/serve.py, pointed at that API
+
+Nothing of the developer's own database or ports is touched.
+
+The browser (first that works): ``E2E_BROWSER_PATH`` (a Chrome / Chromium binary) · Playwright's own
+Chromium (``python -m playwright install chromium``) · the Chromium packaged in the npm module
+@sparticuz/chromium (``cd e2e && npm install`` — for machines that cannot reach Playwright's download
+server). ``E2E_HEADED=1`` shows the window.
 """
 
 from __future__ import annotations
@@ -16,7 +24,6 @@ import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -24,217 +31,223 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = ROOT / "apps" / "web"
 SERVICE = ROOT / "services" / "account"
-DIST = WEB / "dist" / "web" / "browser"
-RELEASE_FILE = WEB / "release.json"
-ADMIN_TOKEN = "e2e-admin-token"
+WEB = ROOT / "apps" / "web"
+WEB_DIST = WEB / "dist" / "web" / "browser"
+E2E = ROOT / "e2e"
 
 
-def _free_port() -> int:
-    with socket.socket() as s:
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def _venv_python() -> str:
-    exe = SERVICE / "venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    return str(exe) if exe.exists() else sys.executable
+def wait_for(url: str, timeout: float = 120, proc: subprocess.Popen | None = None) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(f"{url}: the process exited with code {proc.returncode}")
+        try:
+            with urllib.request.urlopen(url, timeout=2) as res:
+                if res.status < 500:
+                    return
+        except Exception:  # noqa: BLE001 - not up yet
+            time.sleep(0.3)
+    raise RuntimeError(f"{url} did not come up within {timeout} s")
 
 
-TMP_RELEASE = Path(tempfile.mkdtemp(prefix="pa-e2e-release-")) / "release.json"
-# The ads admin console gets its own origin (separate deployment); chosen up front so the API
-# can allow it in CORS_ORIGINS.
-ADS_ADMIN_PORT = _free_port()
+class Stack:
+    """Where everything runs, plus a few helpers the tests share."""
+
+    def __init__(self, api: str, staff: str, admin: str, data_dir: Path, database_url: str, web: bool):
+        self.api, self.staff, self.admin = api, staff, admin
+        self.data_dir, self.database_url, self.web = data_dir, database_url, web
+
+    def get(self, path: str) -> dict:
+        with urllib.request.urlopen(self.api + path, timeout=10) as res:
+            return json.loads(res.read())
+
+    def outbox(self, to: str) -> list[dict]:
+        """What the built-in e-mail / SMS fake "sent" to ``to`` (newest first)."""
+        return self.get(f"/api/v1/messages/fake/outbox.json?to={urllib.request.quote(to)}")["messages"]
+
+    def service_python(self, code: str) -> str:
+        """Run ``code`` with the service's modules against the stack's database (e.g. to put a visit on
+        the agenda that already took place — the booking page only books future slots)."""
+        env = {**os.environ, "DATABASE_URL": self.database_url, "DATA_DIR": str(self.data_dir), "APP_ENV": "test"}
+        env["TOKEN_SECRET"] = "dummy-e2e-token-secret"
+        out = subprocess.run(
+            [sys.executable, "-c", code], cwd=str(SERVICE), env=env, capture_output=True, text=True, check=False
+        )
+        if out.returncode:
+            raise RuntimeError(out.stderr)
+        return out.stdout.strip()
+
+    def visit_today(self, minutes_ago: int = 45, provider_email: str = "dummy-doctor@example.com") -> int:
+        """A visit of Pat Dummy with the doctor that started ``minutes_ago`` minutes ago. Returns its id."""
+        code = f"""
+import json
+from datetime import datetime, timedelta, timezone
+import models
+from database import SessionLocal
+with SessionLocal() as db:
+    pat = db.query(models.Patient).filter_by(email_norm="dummy-patient@example.com").one()
+    doc = db.query(models.Worker).filter_by(email_norm="{provider_email}").one()
+    start = datetime.now(timezone.utc).replace(second=0, microsecond=0) - timedelta(minutes={minutes_ago})
+    a = models.Appointment(patient_id=pat.id, provider_id=doc.id, start_at=start, end_at=start + timedelta(minutes=30),
+                           status="scheduled", reason="Sore throat (dummy e2e visit)")
+    db.add(a)
+    db.commit()
+    print(a.id)
+"""
+        return int(self.service_python(code))
 
 
-def build_web(release_file: Path | None = None) -> None:
-    """`npm run build` with RELEASE_JSON pointing at a temporary descriptor — the committed
-    apps/web/release.json is never modified by the tests."""
-    npm = shutil.which("npm") or "npm"
-    env = {**os.environ, **({"RELEASE_JSON": str(release_file)} if release_file else {})}
-    out = subprocess.run([npm, "run", "build"], cwd=WEB, capture_output=True, text=True, env=env, check=False)
-    assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-2000:]
+def _stale(index: Path) -> bool:
+    """Is the build older than any source / config file of the app?"""
+    built = index.stat().st_mtime
+    sources = [*(WEB / "src").rglob("*"), *(WEB / "public").rglob("*"), WEB / "angular.json", WEB / "release.json"]
+    return any(p.is_file() and p.stat().st_mtime > built for p in sources if p.name != "release-info.ts")
+
+
+def _build_web() -> bool:
+    """The patients' app is served by the API from its production build; (re)built when missing or older
+    than the sources."""
+    index = WEB_DIST / "index.html"
+    if index.is_file() and not _stale(index):
+        return True
+    npm = shutil.which("npm")
+    if not npm or not (WEB / "node_modules").is_dir():
+        return False
+    code = subprocess.call([npm, "run", "build"], cwd=str(WEB), env={**os.environ, "NG_CLI_ANALYTICS": "false"})
+    return code == 0 and (WEB_DIST / "index.html").is_file()
 
 
 @pytest.fixture(scope="session")
-def release_json():
-    """The committed descriptor as a template; generated files are restored after the session."""
-    yield json.loads(RELEASE_FILE.read_text(encoding="utf-8"))
-    subprocess.run([shutil.which("node") or "node", "scripts/prepare-release.mjs"], cwd=WEB, check=False)
-
-
-@pytest.fixture(scope="session")
-def server(release_json):
-    port = _free_port()
-    tmp = tempfile.mkdtemp(prefix="pa-e2e-")
+def stack(tmp_path_factory):
+    data_dir = tmp_path_factory.mktemp("e2e-data")
+    database_url = f"sqlite:///{(data_dir / 'e2e.db').as_posix()}"
+    api_port, staff_port, admin_port = free_port(), free_port(), free_port()
+    api = f"http://127.0.0.1:{api_port}"
+    staff = f"http://127.0.0.1:{staff_port}"
+    admin = f"http://127.0.0.1:{admin_port}"
+    web = _build_web()
     env = {
         **os.environ,
-        "PYTHONUTF8": "1",  # Windows: pytest captures the API's output through a cp1252 pipe otherwise
         "APP_ENV": "test",
-        "DATA_DIR": tmp,
-        "DATABASE_URL": f"sqlite:///{Path(tmp, 'e2e.db').as_posix()}",
-        "TOKEN_SECRET": "e2e-secret",
-        "RELEASE_ADMIN_TOKEN": ADMIN_TOKEN,
-        "WEB_DIST": str(DIST),
-        "SEED_FAKE_ACCOUNTS": "true",  # free@/pro@/admin@example.com … (services/account/seed.py)
-        "ADS_MAX_PER_RESPONSE": "20",  # every matching dummy campaign in one batch (e2e/test_ads.py)
-        "ADS_AFFILIATE_TAG": "tag=e2e-21",  # e2e/test_ad_sources.py checks the appended affiliate tag
-        "ADS_ADMIN_DIST": str(ROOT / "apps" / "ads-admin"),  # the separate console, mounted at /ads-admin/
-        # … and reachable on its own origin too (ads_admin_origin fixture) — the real deployment shape.
-        "CORS_ORIGINS": f"http://127.0.0.1:{ADS_ADMIN_PORT}",
+        "DATA_DIR": str(data_dir),
+        "DATABASE_URL": database_url,
+        "TOKEN_SECRET": "dummy-e2e-token-secret",
+        "SEED_FAKE_ACCOUNTS": "true",
+        "REMINDER_CHECK_SECONDS": "0",
+        "CORS_ORIGINS": f"{staff},{admin}",
+        "STAFF_URL": f"{staff}/",
+        "ADMIN_DASHBOARD_URL": f"{admin}/",
+        "WEB_APP_URL": f"{api}/",
+        "PYTHONUTF8": "1",
     }
-    proc = subprocess.Popen(
-        [
-            _venv_python(),
-            "-m",
-            "uvicorn",
-            "main:app",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--log-level",
-            "warning",
-        ],
-        cwd=SERVICE,
-        env=env,
-    )
-    base = f"http://127.0.0.1:{port}"
-    for _ in range(100):
-        try:
-            urllib.request.urlopen(base + "/api/v1/health", timeout=1)
-            break
-        except Exception:
-            time.sleep(0.2)
-    else:
-        proc.kill()
-        raise RuntimeError("API did not start")
-    yield base
-    proc.terminate()
-    proc.wait(10)
+    if web:
+        env["WEB_DIST"] = str(WEB_DIST)
+    log = open(data_dir / "stack.log", "w", encoding="utf-8")  # noqa: SIM115 - closed at the end
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(api_port)],
+            cwd=str(SERVICE),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        ),
+        subprocess.Popen(
+            [sys.executable, str(ROOT / "apps" / "staff" / "serve.py"), "--port", str(staff_port), "--api", api],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        ),
+        subprocess.Popen(
+            [sys.executable, str(ROOT / "apps" / "admin" / "serve.py"), "--port", str(admin_port), "--api", api],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        ),
+    ]
+    try:
+        wait_for(f"{api}/api/v1/health", proc=procs[0])
+        wait_for(f"{staff}/", proc=procs[1])
+        wait_for(f"{admin}/", proc=procs[2])
+        yield Stack(api, staff, admin, data_dir, database_url, web)
+    finally:
+        for p in procs:
+            p.terminate()
+        for p in procs:
+            try:
+                p.wait(10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+        log.close()
 
 
-class Releaser:
-    """Simulates the deploy pipeline: bump release.json → build → publish the manifest."""
-
-    def __init__(self, base: str, template: dict):
-        self.base = base
-        self.template = template
-
-    def publish(
-        self,
-        version: str,
-        *,
-        critical=False,
-        notes="",
-        min_supported="1.0.0",
-        build=True,
-    ) -> dict:
-        rel = {
-            **self.template,
-            "version": version,
-            "critical": critical,
-            "notes": notes,
-            "minSupportedVersion": min_supported,
-        }
-        TMP_RELEASE.write_text(json.dumps(rel, indent=2) + "\n", encoding="utf-8")
-        if build:
-            build_web(TMP_RELEASE)
-        req = urllib.request.Request(
-            self.base + "/api/v1/release/publish",
-            data=json.dumps(rel).encode(),
-            headers={"Content-Type": "application/json", "X-Admin-Token": ADMIN_TOKEN},
-        )
-        assert urllib.request.urlopen(req).status == 201
-        return rel
-
-
-@pytest.fixture(scope="session")
-def ads_admin_origin(server):
-    """The ads admin console served as its own deployment: separate origin, separate process
-    (apps/ads-admin/serve.py — the same files the nginx image ships), talking to the API via CORS."""
-    proc = subprocess.Popen(
-        env={**os.environ, "PYTHONUTF8": "1"},
-        args=[
-            _venv_python(),
-            str(ROOT / "apps" / "ads-admin" / "serve.py"),
-            "--port",
-            str(ADS_ADMIN_PORT),
-            "--api",
-            server,
-        ],
-        cwd=str(ROOT / "apps" / "ads-admin"),
-    )
-    base = f"http://127.0.0.1:{ADS_ADMIN_PORT}"
-    for _ in range(50):
-        try:
-            urllib.request.urlopen(base + "/config.js", timeout=1)
-            break
-        except Exception:
-            time.sleep(0.2)
-    else:
-        proc.kill()
-        raise RuntimeError("ads admin console did not start")
-    yield base
-    proc.terminate()
-    proc.wait(10)
-
-
-@pytest.fixture(scope="session")
-def releaser(server, release_json):
-    r = Releaser(server, release_json)
-    r.publish("1.0.0", notes="e2e baseline")
-    return r
-
-
-BROWSER_ORDER = ("chromium", "msedge", "chrome", "firefox", "webkit")
-
-
-def launch_any_browser(p):
-    """Launch whatever browser is available, without requiring a download first.
-
-    Order: E2E_BROWSER if set; Playwright's bundled Chromium; Microsoft Edge or Google Chrome
-    installed on the machine (Playwright "channels" — Edge ships with Windows); bundled
-    Firefox/WebKit. If none exists, download Chromium once (`playwright install chromium`).
-    Returns (browser, name).
-    """
-    preferred = os.environ.get("E2E_BROWSER", "").strip().lower()
-    candidates = [preferred] if preferred else list(BROWSER_ORDER)
-    problems = []
-    for name in candidates:
-        try:
-            if name in ("msedge", "chrome"):
-                return p.chromium.launch(channel=name), name
-            return getattr(p, name).launch(), name
-        except Exception as exc:  # noqa: BLE001 — "executable doesn't exist", try the next one
-            problems.append(f"  {name}: {str(exc).splitlines()[0][:100]}")
-    print("No browser found for end-to-end tests:\n" + "\n".join(problems), flush=True)
-    print("Downloading Chromium for Playwright (one-time, ~150 MB)…", flush=True)
-    code = subprocess.call([sys.executable, "-m", "playwright", "install", "chromium"])
-    if code:
-        raise RuntimeError(
-            "Could not download Chromium. Install Google Chrome or Microsoft Edge, or run:  "
-            "services/account/venv/Scripts/python -m playwright install chromium"
-        )
-    return p.chromium.launch(), "chromium (downloaded)"
+def _launch_options() -> dict:
+    options: dict = {"headless": not os.environ.get("E2E_HEADED")}
+    if os.environ.get("E2E_BROWSER_PATH"):
+        options["executable_path"] = os.environ["E2E_BROWSER_PATH"]
+        return options
+    return options
 
 
 @pytest.fixture(scope="session")
 def browser():
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import Error, sync_playwright
 
     with sync_playwright() as p:
-        b, name = launch_any_browser(p)
-        print(f"\n[e2e] using browser: {name} {b.version}", flush=True)
-        b.e2e_name = name  # type: ignore[attr-defined]
+        options = _launch_options()
+        try:
+            b = p.chromium.launch(**options)
+        except Error:
+            # No Playwright browser: the Chromium inside the npm package (cd e2e && npm install).
+            node = shutil.which("node")
+            if not node or not (E2E / "node_modules" / "@sparticuz").is_dir():
+                raise
+            info = json.loads(
+                subprocess.run(
+                    [node, "extract-chromium.mjs"], cwd=str(E2E), capture_output=True, text=True, check=True
+                ).stdout
+            )
+            b = p.chromium.launch(**options, executable_path=info["path"], args=info["args"])
         yield b
         b.close()
 
 
-def phone_context(browser, **kwargs):
-    """A phone-like context. `is_mobile` is Chromium-only; other engines still get touch + viewport."""
-    options = {"viewport": {"width": 390, "height": 844}, "has_touch": True, **kwargs}
-    if "firefox" not in getattr(browser, "e2e_name", "") and "webkit" not in getattr(browser, "e2e_name", ""):
-        options["is_mobile"] = True
-    return browser.new_context(**options)
+@pytest.fixture
+def page(browser):
+    context = browser.new_context(viewport={"width": 1280, "height": 900})
+    pg = context.new_page()
+    pg.set_default_timeout(20_000)
+    yield pg
+    context.close()
+
+
+def staff_sign_in(page, stack, email: str, password: str) -> None:
+    page.goto(f"{stack.staff}/#/login")
+    page.fill("#login-email", email)
+    page.fill("#login-password", password)
+    page.click("#btn-login")
+    page.wait_for_selector("#btn-logout")
+
+
+def admin_sign_in(page, stack, email: str = "dummy-admin@example.com", password: str = "Dummy-Admin-pass-123") -> None:
+    page.goto(f"{stack.admin}/#/login")
+    page.fill("#login-email", email)
+    page.fill("#login-password", password)
+    page.click("#btn-login")
+    page.wait_for_selector("#btn-logout")
+
+
+def draw_signature(page, selector: str = "canvas.sig-canvas") -> None:
+    canvas = page.locator(selector)
+    canvas.scroll_into_view_if_needed()
+    box = canvas.bounding_box()
+    x, y = box["x"] + 30, box["y"] + box["height"] / 2
+    page.mouse.move(x, y)
+    page.mouse.down()
+    for i in range(1, 30):
+        page.mouse.move(x + i * 10, y + (15 if i % 2 else -15))
+    page.mouse.up()

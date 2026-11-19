@@ -1,130 +1,72 @@
-"""Fixtures. SQLite by default; set TEST_DATABASE_URL=postgresql+psycopg://… to run the same
-suite against PostgreSQL (CI does both). Postgres tables come from the Alembic migrations so the
-migration chain itself is under test."""
+"""Test fixtures: a throw-away SQLite database per session, the app started through its lifespan
+(migrations run), and a TestClient. Environment is fixed *before* config is imported."""
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import os
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 SERVICE_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(SERVICE_DIR))
+if str(SERVICE_DIR) not in sys.path:
+    sys.path.insert(0, str(SERVICE_DIR))
 
-_TMP = tempfile.mkdtemp(prefix="pa-account-tests-")
-os.environ["APP_ENV"] = "test"
-os.environ["DATA_DIR"] = _TMP
-os.environ["DATABASE_URL"] = os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{Path(_TMP, 'test.db').as_posix()}"
-os.environ["TOKEN_SECRET"] = "test-secret"
-os.environ["RELEASE_ADMIN_TOKEN"] = "admin-token"
-os.environ["BILLING_FAKE_PROVIDERS"] = "false"  # test_fakes.py switches the built-in providers on explicitly
-os.environ["MESSAGING_FAKE_PROVIDERS"] = "true"  # e-mail / SMS codes land in the fake outbox (messaging.py)
-for _var in ("SMTP_HOST", "TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM", "SMS_WEBOTP_HOST"):
-    os.environ.pop(_var, None)
-os.environ["RELEASE_FILE"] = str(Path(_TMP, "missing-release.json"))  # no fallback manifest in tests
-os.environ.pop("CORS_ORIGINS", None)
-os.environ.pop("WEB_DIST", None)
-
-import ads  # noqa: E402
-import config  # noqa: E402
-import database  # noqa: E402
-import main  # noqa: E402
-import messaging  # noqa: E402
-import models  # noqa: E402
-import twofactor  # noqa: E402
-from ratelimit import FailureLimiter, RateLimiter  # noqa: E402
+_tmp = tempfile.mkdtemp(prefix="account-tests-")
 
 
-def _reset_schema() -> None:
-    if config.IS_POSTGRES:
-        from alembic.config import Config
+def _fresh_postgres(url: str) -> None:
+    """``python dev.py test --postgres``: the tests run against TEST_DATABASE_URL — created when missing,
+    emptied first (a clean schema, migrated by the app). Only a database whose name ends in ``_test``."""
+    import psycopg
 
-        from alembic import command
-
-        cfg = Config(str(SERVICE_DIR / "alembic.ini"))
-        cfg.set_main_option("script_location", str(SERVICE_DIR / "alembic"))
-        command.downgrade(cfg, "base")
-        command.upgrade(cfg, "head")
-    else:
-        from sqlalchemy import text
-
-        models.Base.metadata.drop_all(bind=database.engine)
-        with database.engine.begin() as conn:
-            conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
-        database.migrate()  # SQLite is migrated with Alembic too — same chain as PostgreSQL
+    plain = url.replace("postgresql+psycopg://", "postgresql://", 1)
+    base, _, name = plain.rpartition("/")
+    name = name.split("?", 1)[0]
+    if not name.endswith("_test"):
+        raise pytest.UsageError(f"TEST_DATABASE_URL must name a database ending in _test (got {name!r}).")
+    with psycopg.connect(f"{base}/postgres", autocommit=True) as conn:
+        if not conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,)).fetchone():
+            conn.execute(f'CREATE DATABASE "{name}"')
+    with psycopg.connect(plain, autocommit=True) as conn:
+        conn.execute("DROP SCHEMA public CASCADE")
+        conn.execute("CREATE SCHEMA public")
 
 
-@pytest.fixture()
+if os.environ.get("TEST_DATABASE_URL"):
+    _fresh_postgres(os.environ["TEST_DATABASE_URL"])
+    os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+    os.environ.setdefault("AUTO_MIGRATE", "true")  # PostgreSQL is migrated by the app only when asked to
+
+os.environ.setdefault("APP_ENV", "test")
+os.environ.setdefault("DATA_DIR", _tmp)
+os.environ.setdefault("DATABASE_URL", f"sqlite:///{Path(_tmp, 'test.db').as_posix()}")
+os.environ.setdefault("TOKEN_SECRET", "dummy-test-secret-not-for-real-use")
+os.environ.setdefault("SEED_FAKE_ACCOUNTS", "false")
+
+
+@pytest.fixture(scope="session")
 def client():
-    _reset_schema()
-    # The anonymous ad endpoints are rate-limited per caller; every test starts with a clean window.
-    ads.SERVE_LIMITER = ads.RateLimiter(ads.SERVE_LIMITER.limit, ads.SERVE_LIMITER.window)
-    ads.METRICS_LIMITER = ads.RateLimiter(ads.METRICS_LIMITER.limit, ads.METRICS_LIMITER.window)
-    # Two-factor: fresh per-account counters and an empty test inbox for every test.
-    twofactor.LIMITER = FailureLimiter(config.TWO_FACTOR_MAX_FAILURES, config.TWO_FACTOR_FAILURE_WINDOW_SECONDS)
-    twofactor.SEND_LIMITER = RateLimiter(config.TWO_FACTOR_MAX_SENDS, config.TWO_FACTOR_SEND_WINDOW_SECONDS)
-    messaging.OUTBOX.clear()
+    from fastapi.testclient import TestClient
+
+    import main
+
     with TestClient(main.app) as c:
         yield c
 
 
-# ---------------------------------------------------------------------------- helpers
+@pytest.fixture(scope="session")
+def admin_headers(client):
+    """A signed-in administrator (seed.py's admin account)."""
+    import clientcrypto
+    import seed
+    from database import SessionLocal
 
-
-def auth_key_for(password: str, email: str) -> str:
-    """What the PWA derives on the device (see crypto.ts) — the server only ever sees this."""
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), hashlib.sha256(email.encode()).digest(), 1000).hex()
-
-
-def register(client, email="ann@example.com", password="correct horse", device=None, version="1.0.0", schema=1):
-    r = client.post(
-        "/api/v1/auth/register",
-        json={
-            "email": email,
-            "auth_key": auth_key_for(password, email),
-            "wrapped_data_key": base64.b64encode(b"wrapped-key-" + email.encode()).decode(),
-            "kdf_params": {"kdf": "pbkdf2", "iterations": 1000},
-            "device": device or {"platform": "web", "client_version": version, "schema_version": schema},
-        },
-    )
-    assert r.status_code == 201, r.text
-    return r.json()
-
-
-def login(client, email="ann@example.com", password="correct horse", version="1.0.0", schema=1):
-    r = client.post(
-        "/api/v1/auth/login",
-        json={
-            "email": email,
-            "auth_key": auth_key_for(password, email),
-            "device": {"platform": "web", "client_version": version, "schema_version": schema},
-        },
-    )
-    assert r.status_code == 200, r.text
-    return r.json()
-
-
-def headers(session, version="1.0.0", schema=1):
-    return {"Authorization": f"Bearer {session['token']}", "X-Client-Version": version, "X-Schema-Version": str(schema)}
-
-
-def go_pro(client, session):
-    assert client.post("/api/v1/billing/trial", headers=headers(session)).status_code == 200
-
-
-def cipher(text: str) -> str:
-    """Stand-in for the client's AES-GCM output: the server must treat it as opaque bytes."""
-    return base64.b64encode(b"\x00ENC" + text.encode()).decode()
-
-
-@pytest.fixture()
-def pro(client):
-    session = register(client)
-    go_pro(client, session)
-    return session
+    with SessionLocal() as db:
+        seed.seed(db, log=lambda *a: None)
+    auth_key, _ = clientcrypto.derive_keys(seed.password_for("admin"), seed.email_for("admin"))
+    res = client.post("/api/v1/auth/login", json={"email": seed.email_for("admin"), "auth_key": auth_key})
+    assert res.status_code == 200, res.text
+    return {"Authorization": f"Bearer {res.json()['token']}"}

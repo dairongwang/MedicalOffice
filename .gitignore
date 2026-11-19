@@ -14,8 +14,8 @@ dist/
 out-tsc/
 npm-debug.log*
 
-# Data & local services
-data/
+# Data & local services (anchored: apps/web/src/app/core/data/ is source code, not data)
+/services/account/data/
 *.db
 *.db-*
 .pgdata/

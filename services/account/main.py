@@ -3,6 +3,17 @@
     /api/v1/auth/*      register · login (+ login/2fa, login/2fa/send: second factor) · logout · sign out everywhere
                         oauth/providers · oauth/{google|facebook}/start → callback · oauth/complete  (sign in with …)
     /api/v1/me          account, devices, entitlements, settings, two-factor (app · SMS · e-mail), delete
+    /api/v1/me/patients, /api/v1/me/appointments   a signed-in patient: own records (link by identity) and
+                        appointments (appointments.py)
+    /api/v1/me/payment-methods   a signed-in patient: the cards, Stripe / PayPal wallets and bank accounts
+                        on file — list · add · update · delete · default · validate (a small-amount
+                        authorization; patient_payment_methods.py); /api/v1/patients/{id}/payment-methods
+                        is the same for administrators, by patient record
+    /api/v1/me/payments   the patient's payment history — the copay / self-pay hold of every visit (charged when
+                        completed, released when canceled), statements, refunds, validations (patient_payments.py);
+                        /api/v1/patients/{id}/payments for the office (+ charge · capture · release · refund)
+                        /api/v1/patient-payments (+ /export.csv): every patient's payments in one ledger —
+                        the office administration dashboard's Payments tab (administrators)
     /api/v1/messages/fake/outbox   test inbox of the built-in e-mail/SMS fake (dev/test only)
     /api/v1/membership  the membership types (anonymous · free · paid · admin) and their limits
     /api/v1/billing/*   methods · checkout · cancel (+preview) · payments · manage · webhooks/{stripe,paypal} · trial
@@ -10,6 +21,51 @@
     /api/v1/sync/*      push · pull · ack · status · snapshot   (ciphertext relay)
     /api/v1/release/*   manifest · check · publish · history   (client update policy)
     /api/v1/ads/*       serve · metrics   (first-party sponsored content for free memberships, anonymous)
+    /api/v1/patients/*  check · register (public intake page: is the patient new? → create the record, with
+                        the insurance details and card photos + an eligibility check) · list · detail ·
+                        insurance-card/{side} · insurance/verify · insurance/verifications (administrators)
+    /api/v1/patients/update/*  request · confirm · me · (PUT)   a patient updates their own record after a
+                        one-time code to the contact details on file; /api/v1/me/patients/{id} (GET · PUT) does
+                        the same for a signed-in patient account (patient_updates.py)
+    /api/v1/appointments/*  providers · slots · lookup · book · cancel (patients page: a registered patient
+                        books a slot inside a provider's availability) · agenda · update (administrators)
+    /api/v1/check-ins/{token}   the check-in page: questionnaire + signature, the estimated cost not covered by
+                        insurance + signature, then the pre-authorization — only then is the visit checked in
+    /api/v1/staff/*     staff dashboard accounts: account/verify → account (code to the work e-mail) ·
+                        me · me/appointments (+ /{id}/check-in answers) · me/availability (staff_accounts.py)
+    /api/v1/appointments/{id}/assistant(s), /api/v1/assignments   the office assigns a medical assistant who
+                        is available for the visit (reassigns when they report they cannot do it) ·
+                        /api/v1/staff/me/tasks: the assistant's tasks — take · review (vital signs; the
+                        medication / allergy lists from the chart + the check-in, each item cleared with a
+                        note) · complete (every duty) · report "I cannot do it" (assignments.py,
+                        assistant_review.py); /api/v1/patients/{id}/health-items: the chart's lists
+    /api/v1/staff/me/appointments/{id}/chart (+ /visit-note)   the provider's chart once the assistant is
+                        done (they are notified): previous visits, history, medications, allergies, results,
+                        referrals, the check-in, the assistant's work; /api/v1/patients/{id}/results and
+                        /referrals: kept by the office (clinical.py); …/diagnoses and …/prescriptions
+                        (+ /pdf, /send to a pharmacy, /void) written on the chart; /api/v1/pharmacies
+                        (prescriptions.py), …/pharmacy (the patient's pharmacy), …/referrals: letters
+                        the provider writes (referrals.py)
+    /api/v1/staff/me/appointments/{id}/visit-summary (+ /sign, /amend, /send, /pdf)   after the visit the patient
+                        gets a summary of it, signed by the doctor: a draft is prepared from the chart once the
+                        visit is over (the office completes it, or the job finds it ended), the doctor edits and
+                        signs it, it is e-mailed to the patient (PDF) and shown in the patients' app —
+                        /api/v1/me/appointments/{id}/visit-summary; /api/v1/appointments/{id}/visit-summary for the
+                        office (visit_summaries.py)
+    /api/v1/patients/{id}/immunizations   the vaccines in the record (the office enters them; the chart shows them)
+    /api/v1/patient-reports, /api/v1/me/reports, /api/v1/staff/me/reports   on request the office prepares the
+                        immunization record or the annual health examination report of a patient from the
+                        record; a doctor completes and signs it; the patient gets it by e-mail (PDF) and in the
+                        app (patient_reports.py)
+    /api/v1/me/medications   the patients' app's "My medicines" page: one tab per record on the account — the
+                        prescription medicines to take with the dosing, the directions and the prescriber's
+                        instructions, the ones stopped, the prescriptions issued, allergies (patient_medications.py)
+    /api/v1/workers/*   check · register (staff dashboard: doctor/nurse/… new? → record + standard week) ·
+                        availability/lookup · availability (the worker's week) · list · detail (administrators)
+    /api/v1/applications/*, /api/v1/onboarding/*   hiring: job applications with age / licence / background
+                        checks, hire → onboarding checklist (staff dashboard; hiring.py); invite links + the
+                        new hire's portal (forms, e-signatures) (portal.py, invites.py, esign.py)
+    /api/v1/links       where the separately deployed front-ends live (staff / office administration dashboards)
     /api/v1/health
 
 It stores account + billing rows and relays end-to-end-encrypted sync operations. It holds no
@@ -19,6 +75,7 @@ built PWA (WEB_DIST) so one process can host everything on a LAN.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -36,20 +93,40 @@ import accounts
 import ad_sources
 import admin
 import ads
+import appointments
+import assignments
 import auth
 import billing
+import check_ins
+import clinical
 import config
 import docs_gate
 import fakes
+import health_records
+import hiring
+import immunizations
 import membership
 import messaging
 import models
 import oauth
+import patient_medications
+import patient_payment_methods
+import patient_payments
+import patient_reports
+import patient_updates
+import patients
 import payments
+import portal
+import prescriptions
+import referrals
 import releases
+import reminders
 import schemas
+import staff_accounts
 import sync
 import twofactor
+import visit_summaries
+import workers
 from database import SessionLocal, get_db, init_db
 
 log = logging.getLogger("account")
@@ -71,7 +148,7 @@ async def lifespan(app: FastAPI):
     # What this process decided from its environment — the first thing to check when "prod"
     # behaviour (docs gate, no fake accounts) seems to be missing.
     print(
-        f"Personal Assistant API v{config.SERVICE_VERSION} · APP_ENV={config.ENV} · "
+        f"Medic Office management API v{config.SERVICE_VERSION} · APP_ENV={config.ENV} · "
         f"database={'postgresql' if config.IS_POSTGRES else 'sqlite'} · "
         f"api docs={'administrators only' if config.DOCS_REQUIRE_ADMIN else 'open'}",
         flush=True,
@@ -82,9 +159,23 @@ async def lifespan(app: FastAPI):
         with SessionLocal() as db:
             seed.seed(db, log=lambda fmt, *args: print(fmt % args, flush=True))
             seed.seed_ads(db, log=lambda fmt, *args: print(fmt % args, flush=True))
+            seed.seed_workers(db, log=lambda fmt, *args: print(fmt % args, flush=True))
+            seed.seed_applications(db, log=lambda fmt, *args: print(fmt % args, flush=True))
+            seed.seed_payment_methods(db, log=lambda fmt, *args: print(fmt % args, flush=True))
+            seed.seed_pharmacies(db, log=lambda fmt, *args: print(fmt % args, flush=True))
+            seed.seed_patients(db, log=lambda fmt, *args: print(fmt % args, flush=True))
+            seed.seed_assignments(db, log=lambda fmt, *args: print(fmt % args, flush=True))
+            seed.seed_reports(db, log=lambda fmt, *args: print(fmt % args, flush=True))
+            seed.seed_family(db, log=lambda fmt, *args: print(fmt % args, flush=True))
     with SessionLocal() as db:  # aggregate ad counters older than the retention window
         ads.prune_stats(db)
         twofactor.prune_codes(db)  # expired two-factor codes sent by e-mail / text
+    # Appointment reminders the day before (reminders.py): an in-process job; 0 = off (tests).
+    reminder_job = (
+        asyncio.create_task(reminders.run_forever(config.REMINDER_CHECK_SECONDS))
+        if config.REMINDER_CHECK_SECONDS > 0
+        else None
+    )
     print(
         "Two-factor codes: e-mail="
         + (
@@ -95,14 +186,18 @@ async def lifespan(app: FastAPI):
             else "off"
         )
         + " · text message="
-        + ("fake" if messaging.SMS_CHANNEL.fake else "twilio" if messaging.SMS_CHANNEL.configured() else "off"),
+        + ("fake" if messaging.SMS_CHANNEL.fake else "twilio" if messaging.SMS_CHANNEL.configured() else "off")
+        + f" · appointment reminders={config.REMINDER_HOURS_BEFORE:g}h before"
+        + (f", checked every {config.REMINDER_CHECK_SECONDS}s" if reminder_job else " (job off)"),
         flush=True,
     )
     yield
+    if reminder_job:
+        reminder_job.cancel()
 
 
 app = FastAPI(
-    title="Personal Assistant — Account & Sync Service",
+    title="Medic Office management — API",
     version=config.SERVICE_VERSION,
     description=__doc__,
     lifespan=lifespan,
@@ -186,6 +281,8 @@ def register(body: schemas.RegisterRequest, db: Session = Depends(get_db)):
         auth_hash=auth.hash_auth_key(body.auth_key, salt),
         wrapped_data_key=body.wrapped_data_key,
         kdf_params=json.dumps(body.kdf_params),
+        # The patients' app creates patient accounts, nothing else (auth.check_audience).
+        role=models.ROLE_PATIENT if body.audience == "patient" else models.ROLE_USER,
     )
     auth.apply_bootstrap_role(account)
     db.add(account)
@@ -214,6 +311,7 @@ def login(body: schemas.LoginRequest, db: Session = Depends(get_db)):
     ):
         raise HTTPException(status_code=401, detail="E-mail or password is incorrect.")
     auth.apply_bootstrap_role(account)
+    auth.check_audience(account, body.audience)
     if account.two_factor_enabled:
         challenge = twofactor.challenge_for(db, account)  # sends the code when the preferred method is sms/e-mail
         db.commit()  # the bootstrap role, if any
@@ -238,6 +336,7 @@ def login_two_factor(body: schemas.TwoFactorLoginRequest, db: Session = Depends(
     text message or e-mail) or a recovery code → the session. Wrong codes are counted per
     account (429 after too many)."""
     account, _method = twofactor.complete_login(db, body.challenge, body.code)
+    auth.check_audience(account, body.audience)
     device = _register_device(db, account, body.device)
     db.commit()
     return _session(account, device)
@@ -253,10 +352,16 @@ def oauth_providers():
 
 
 @api.get("/auth/oauth/{name}/start", include_in_schema=True, tags=["auth"], response_class=RedirectResponse)
-def oauth_start(name: str, request: Request, return_to: str | None = Query(default=None, max_length=2048)):
+def oauth_start(
+    name: str,
+    request: Request,
+    return_to: str | None = Query(default=None, max_length=2048),
+    audience: schemas.Audience = Query(default="office"),
+):
     """Send the browser here (a navigation, not a fetch): it continues at the provider and comes
-    back to ``return_to#oauth=<ticket>`` — or ``#oauth_error=<message>``."""
-    return RedirectResponse(oauth.start_url(request, name, return_to), status_code=302)
+    back to ``return_to#oauth=<ticket>`` — or ``#oauth_error=<message>``. ``audience=patient``
+    (the patients' app) creates patient accounts and refuses other roles."""
+    return RedirectResponse(oauth.start_url(request, name, return_to, audience=audience), status_code=302)
 
 
 @api.get("/auth/oauth/{name}/callback", include_in_schema=False)
@@ -290,6 +395,7 @@ def oauth_complete(body: schemas.OAuthCompleteRequest, db: Session = Depends(get
     """Exchange the ticket for a session. Like the password step: an account with two-factor
     authentication gets ``202`` + a challenge instead (the provider was the first factor)."""
     account = oauth.complete(db, body.ticket)
+    auth.check_audience(account, body.audience)
     if account.two_factor_enabled:
         challenge = twofactor.challenge_for(db, account)
         db.commit()
@@ -733,6 +839,14 @@ def ads_fake_network(region: str = "ZZ", lang: str = ""):
 # ==================== Meta ====================
 
 
+@api.get("/links", tags=["meta"])
+def links():
+    """Where the other front-ends live — the main app links to the staff dashboard and the
+    office administration dashboard from here, so the URLs are configured once (STAFF_URL,
+    ADMIN_DASHBOARD_URL) instead of being baked into a build."""
+    return {"staff_url": config.STAFF_URL, "admin_url": config.ADMIN_DASHBOARD_URL}
+
+
 @api.get("/health", tags=["meta"])
 def health():
     return {
@@ -747,11 +861,73 @@ def health():
 
 
 api.include_router(admin.router)
+api.include_router(patient_updates.router)  # a patient updates their own record, by code (patient_updates.py)
+api.include_router(patient_updates.me_router)  # … or signed in with the patient account the record is linked to
+api.include_router(patients.router)  # public intake + patient roster (patients.py)
+api.include_router(appointments.router)  # patients book slots with providers (appointments.py)
+api.include_router(appointments.me_router)  # a signed-in patient: own records + appointments
+api.include_router(check_ins.router)  # the check-in page: questionnaire, estimate, signatures, pre-authorization
+api.include_router(patient_payment_methods.me_router)  # … and the payment methods on file (patient dashboard)
+api.include_router(patient_payment_methods.admin_router)  # the same for the office, by patient record
+api.include_router(patient_payments.me_router)  # the patient's payment history (holds, charges, refunds)
+api.include_router(patient_payments.admin_router)  # … and the office's: history · charge · capture · release · refund
+api.include_router(patient_payments.office_router)  # the office-wide ledger (Payments tab) + CSV export
+api.include_router(workers.router)  # staff roster + availability (workers.py)
+api.include_router(staff_accounts.router)  # staff dashboard accounts: sign-up, own appointments + week
+api.include_router(assignments.admin_router)  # the office assigns medical assistants to appointments
+api.include_router(assignments.staff_router)  # … and the assistant's "My tasks": take · review · complete · report
+api.include_router(health_records.router)  # patients' medication and allergy lists (kept current by the review)
+api.include_router(clinical.admin_router)  # lab / imaging results and referral notes (the office keeps them)
+api.include_router(clinical.staff_router)  # the provider's chart of the patient + the visit note
+api.include_router(prescriptions.staff_router)  # … diagnoses, prescriptions (PDF / e-mail to a pharmacy)
+api.include_router(prescriptions.admin_router)  # the pharmacy directory; prescriptions for the front desk
+api.include_router(referrals.staff_router)  # … referrals the provider writes (a signed letter, PDF / e-mail)
+api.include_router(referrals.admin_router)  # the letter for the front desk to print
+api.include_router(visit_summaries.staff_router)  # the after-visit summary: prepared, edited, signed by the doctor
+api.include_router(visit_summaries.me_router)  # … the patient reads it in the app (PDF too)
+api.include_router(visit_summaries.admin_router)  # … the office prints / resends it
+api.include_router(immunizations.router)  # the vaccines in the patient's record (the office enters them)
+api.include_router(patient_reports.admin_router)  # reports on request: the office's queue, preparing them
+api.include_router(patient_reports.staff_router)  # … the doctor completes and signs them
+api.include_router(patient_reports.me_router)  # … the patient asks for them and downloads them
+api.include_router(patient_medications.me_router)  # the patients' app's "My medicines" page, a tab per record
+api.include_router(hiring.router)  # job applications + onboarding (hiring.py)
+api.include_router(portal.router)  # new-hire onboarding portal + invite links (portal.py, invites.py)
 api.include_router(fakes.router)  # built-in Stripe/PayPal stand-ins (404 unless BILLING_FAKE_PROVIDERS)
 api.include_router(messaging.router)  # built-in e-mail/SMS test inbox (404 unless MESSAGING_FAKE_PROVIDERS)
 api.include_router(oauth.router)  # built-in Google/Facebook consent screens (404 unless OAUTH_FAKE_PROVIDERS)
 app.include_router(api)
 docs_gate.install(app)  # /api/docs · /api/redoc · /api/openapi.json
+
+
+# ==================== Optional: serve the separate staff dashboard ====================
+# apps/staff is its own deployment (static files, own container/CDN) talking to this API across
+# origins (CORS_ORIGINS). For single-process setups (`dev.py serve`, small self-hosted) it can be
+# served from here at /staff/ (STAFF_DIST).
+if config.STAFF_DIST and config.STAFF_DIST.is_dir():
+
+    class StaffStatic(StaticFiles):
+        async def get_response(self, path: str, scope):
+            response = await super().get_response(path, scope)
+            response.headers["Cache-Control"] = "no-cache"
+            response.headers["X-Frame-Options"] = "DENY"
+            return response
+
+    app.mount("/staff", StaffStatic(directory=config.STAFF_DIST, html=True), name="staff")
+
+
+# ==================== Optional: serve the separate office administration dashboard ====================
+# apps/admin (patients roster, appointment agenda) — same arrangement as the staff dashboard.
+if config.ADMIN_DASHBOARD_DIST and config.ADMIN_DASHBOARD_DIST.is_dir():
+
+    class AdminStatic(StaticFiles):
+        async def get_response(self, path: str, scope):
+            response = await super().get_response(path, scope)
+            response.headers["Cache-Control"] = "no-cache"
+            response.headers["X-Frame-Options"] = "DENY"
+            return response
+
+    app.mount("/admin", AdminStatic(directory=config.ADMIN_DASHBOARD_DIST, html=True), name="admin")
 
 
 # ==================== Optional: serve the separate ad-admin dashboard ====================

@@ -149,8 +149,49 @@ def current_principal(
 def apply_bootstrap_role(account: models.Account) -> None:
     """ADMIN_EMAILS (config) promotes an account on register/login — the way the first
     administrator of a fresh deployment is created. Never demotes."""
-    if account.email.lower() in config.ADMIN_EMAILS and account.role != models.ROLE_ADMIN:
+    if (
+        account.email.lower() in config.ADMIN_EMAILS
+        and account.role != models.ROLE_ADMIN
+        and account.role != models.ROLE_PATIENT  # a patient account never becomes an administrator by e-mail
+    ):
         account.role = models.ROLE_ADMIN
+
+
+def optional_principal(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+) -> Principal | None:
+    """The signed-in account when a valid token is sent, None otherwise (public endpoints that
+    do a little more for a signed-in patient, e.g. booking links the record to the account)."""
+    if not authorization:
+        return None
+    try:
+        return current_principal(authorization, db)
+    except HTTPException:
+        return None
+
+
+def check_audience(account: models.Account, audience: str) -> None:
+    """The patients' web app (audience "patient") signs in patient accounts only; the staff and
+    office administration dashboards (audience "office") never sign in patients."""
+    if audience == "patient" and account.role != models.ROLE_PATIENT:
+        raise HTTPException(
+            status_code=403,
+            detail="This sign-in is for patients. Staff and administrators use the staff dashboard or the "
+            "office administration dashboard.",
+        )
+    if audience == "office" and account.role == models.ROLE_PATIENT:
+        raise HTTPException(
+            status_code=403,
+            detail="This is a patient account. Please sign in on the patients' app.",
+        )
+
+
+def patient_principal(p: Principal = Depends(current_principal)) -> Principal:
+    """A signed-in *patient account* (role = patient): /me/patients, /me/appointments."""
+    if p.account.role != models.ROLE_PATIENT:
+        raise HTTPException(status_code=403, detail="This needs a patient account.")
+    return p
 
 
 def admin_principal(p: Principal = Depends(current_principal)) -> Principal:

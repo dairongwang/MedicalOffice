@@ -9,20 +9,17 @@ import {
   viewChild,
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
+import { Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
 import { AccountDialog } from './core/account/account-dialog';
 import { AccountService } from './core/account/account.service';
 import { AdInfoDialog } from './core/ads/ad-info-dialog';
-import { AdPanel } from './core/ads/ad-panel';
 import { AdsService } from './core/ads/ads.service';
 import { AdminDialog } from './core/admin/admin-dialog';
-import { EventsService } from './core/data/events.service';
-import { TasksService } from './core/data/tasks.service';
-import { TodayService } from './core/data/today.service';
-import type { CalendarEvent, Task, TaskStatus } from './core/db/models';
 import { MembershipService } from './core/membership/membership.service';
 import { RELEASE } from './core/release-info';
 import { SyncService } from './core/sync/sync.service';
-import { formatDue, formatEventTime } from './core/ui/format';
+import { LinksService } from './core/links.service';
+import { ShellService } from './core/ui/shell.service';
 import { TipDirective } from './core/ui/tip.directive';
 import { ToastService } from './core/ui/toast.service';
 import { TooltipService, topLayerHide, topLayerShow } from './core/ui/tooltip.service';
@@ -30,29 +27,24 @@ import { UiStateService, isTyping } from './core/ui/ui-state.service';
 import { ForcedUpdate } from './core/update/forced-update';
 import { UpdateDialog } from './core/update/update-dialog';
 import { UpdateService } from './core/update/update.service';
-import { EventDialog } from './features/dashboard/event-dialog';
-import { TaskDialog } from './features/dashboard/task-dialog';
 
 @Component({
   selector: 'app-root',
   imports: [
     FormsModule,
+    RouterOutlet,
+    RouterLink,
+    RouterLinkActive,
     TipDirective,
-    TaskDialog,
-    EventDialog,
     UpdateDialog,
     AccountDialog,
     AdminDialog,
-    AdPanel,
     AdInfoDialog,
     ForcedUpdate,
   ],
   templateUrl: './app.html',
 })
 export class App implements AfterViewInit {
-  readonly tasks = inject(TasksService);
-  readonly events = inject(EventsService);
-  readonly today = inject(TodayService);
   readonly account = inject(AccountService);
   readonly membership = inject(MembershipService);
   readonly sync = inject(SyncService);
@@ -60,7 +52,10 @@ export class App implements AfterViewInit {
   readonly ads = inject(AdsService);
   readonly toast = inject(ToastService);
   readonly tooltips = inject(TooltipService);
+  readonly links = inject(LinksService);
   private readonly ui = inject(UiStateService);
+  private readonly shell = inject(ShellService);
+  private readonly router = inject(Router);
 
   readonly version = RELEASE.version;
   readonly online = signal(navigator.onLine);
@@ -69,11 +64,6 @@ export class App implements AfterViewInit {
     month: 'long',
     day: 'numeric',
   });
-  readonly formatDue = formatDue;
-  readonly formatEventTime = formatEventTime;
-
-  readonly taskDialog = viewChild.required(TaskDialog);
-  readonly eventDialog = viewChild.required(EventDialog);
   readonly updateDialog = viewChild.required(UpdateDialog);
   readonly accountDialog = viewChild.required(AccountDialog);
   readonly adminDialog = viewChild.required(AdminDialog);
@@ -81,25 +71,15 @@ export class App implements AfterViewInit {
   readonly tooltipHost = viewChild.required<ElementRef<HTMLElement>>('tooltipHost');
   readonly toastHost = viewChild.required<ElementRef<HTMLElement>>('toastHost');
 
-  readonly emptyText = computed(() =>
-    this.tasks.search() || this.tasks.filterStatus()
-      ? 'No tasks match.'
-      : 'No tasks yet. Tap + to add one.',
-  );
-  /** Header badge: membership + task usage, e.g. "Free · 2/3" or "Pro". */
-  readonly membershipBadge = computed(() => {
-    const check = this.tasks.limit();
-    const label = this.membership.strategy().shortLabel;
-    return check.limit === null ? label : `${label} · ${this.tasks.activeCount()}/${check.limit}`;
-  });
+  /** Header badge: the membership, e.g. "Free" or "Pro". */
+  readonly membershipBadge = computed(() => this.membership.strategy().shortLabel);
   readonly membershipTip = computed(() => {
-    const s = this.membership.strategy();
-    const usage = this.tasks.usageLabel();
-    const who = s.hasAccount
+    const strategy = this.membership.strategy();
+    const who = strategy.hasAccount
       ? `Signed in as ${this.account.session()?.email ?? ''}. `
       : 'No account. ';
-    const hint = s.upgradeHint();
-    return `${who}${s.label} membership: ${usage}${s.maxActiveTasks === null ? ' (unlimited)' : ''}.${hint ? ' ' + hint : ''} Tap for account options.`;
+    const hint = strategy.upgradeHint();
+    return `${who}${strategy.label} membership.${hint ? ' ' + hint : ''} Tap for account options.`;
   });
   readonly accountTip = computed(() => {
     if (!this.account.signedIn()) return 'Account: log in or register.';
@@ -119,6 +99,11 @@ export class App implements AfterViewInit {
   );
 
   constructor() {
+    // Routed pages (patient registration, appointments) open the app-wide dialogs through the shell.
+    this.shell.register({
+      openAccount: (mode) => this.openAccount(mode),
+      openAdInfo: () => this.openAdInfo(),
+    });
     // Toast: show/hide in the top layer (above dialogs).
     effect(() => {
       const t = this.toast.current();
@@ -156,14 +141,11 @@ export class App implements AfterViewInit {
     this.sync.init();
     this.update.init();
     this.ads.init();
+    void this.links.load();
 
     await this.finishOAuthReturn();
 
     const params = new URLSearchParams(location.search);
-    if (params.get('new') === 'task') {
-      history.replaceState(null, '', '/');
-      setTimeout(() => this.taskDialog().open(), 50);
-    }
     if (params.get('billing') === 'canceled') {
       history.replaceState(null, '', '/');
       this.toast.show('Checkout canceled — nothing was charged.');
@@ -202,8 +184,10 @@ export class App implements AfterViewInit {
     }
     try {
       const result = await this.account.completeOAuth(back.ticket, back.provider);
-      if (result === 'signed-in') this.toast.show('Signed in');
-      else setTimeout(() => this.openAccount('login'), 50); // code or passphrase step
+      if (result === 'signed-in') {
+        this.toast.show('Signed in');
+        void this.router.navigateByUrl('/patients/mine'); // a patient signs in to see their appointments
+      } else setTimeout(() => this.openAccount('login'), 50); // code or passphrase step
     } catch (e) {
       this.account.oauthError.set(e instanceof Error ? e.message : String(e));
       setTimeout(() => this.openAccount('login'), 50);
@@ -213,42 +197,12 @@ export class App implements AfterViewInit {
   private shortcuts(e: KeyboardEvent) {
     if (isTyping() || e.metaKey || e.ctrlKey || e.altKey || document.querySelector('dialog[open]'))
       return;
-    if (e.key === 'n') {
+    if (e.key === '?') {
       e.preventDefault();
-      this.taskDialog().open();
-    } else if (e.key === 'e') {
-      e.preventDefault();
-      this.eventDialog().open();
-    } else if (e.key === '/') {
-      e.preventDefault();
-      document.getElementById('search')?.focus();
+      this.toggleHelp();
     }
   }
 
-  checkLabel(task: Task) {
-    return task.status === 'done'
-      ? `Mark "${task.title}" as not done`
-      : `Mark "${task.title}" as done`;
-  }
-
-  onFilter(value: string) {
-    this.tasks.filterStatus.set(value as TaskStatus | '');
-  }
-
-  async toggle(task: Task) {
-    try {
-      await this.tasks.toggleDone(task);
-    } catch (e) {
-      this.toast.error(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  openTask(task: Task | null = null) {
-    this.taskDialog().open(task);
-  }
-  openEvent(ev: CalendarEvent | null = null) {
-    this.eventDialog().open(ev);
-  }
   openAdmin() {
     this.adminDialog().open();
   }

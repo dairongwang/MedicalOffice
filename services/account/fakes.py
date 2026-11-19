@@ -1,48 +1,53 @@
-"""Built-in fakes of Stripe and PayPal — stand-ins for the real providers while their
-credentials are missing (config.BILLING_FAKE_PROVIDERS: on outside prod, never in prod).
+"""Built-in fakes of Stripe and PayPal — what answers when a provider's credentials are missing.
 
-Each fake is three things:
+``payments.StripePayment`` / ``payments.PayPalPayment`` run **unchanged** against these: the same REST
+calls (through ``transport``, an in-process stand-in for ``payments.HttpTransport``), the same signed
+webhooks (``Stripe-Signature`` HMAC; PayPal's verify-webhook-signature call) and the same hosted pages —
+only the "provider" lives in this process and its pages are served by this API:
 
-1. a tiny "provider account" in memory (customers, subscriptions, orders, charges, refunds,
-   issued webhooks), persisted to ``DATA_DIR/billing_fakes.json`` so it survives API restarts;
-2. a *transport* answering the REST calls the strategies make — ``payments.py`` talks to it
-   exactly as it talks to the real API (same paths, same form/JSON payloads, same answers), so
-   the strategy code under test is the production code;
-3. hosted pages served by this API under ``/api/v1/billing/fake/…`` that stand in for the
-   provider's checkout / approval / portal pages. Buttons there do what a buyer (or the
-   provider's scheduler, or an operator in the provider's dashboard) would do: pay, pay with a
-   card that is declined, approve, cancel, renew, fail a payment, recover it, refund.
+    GET/POST /api/v1/billing/fake/stripe/checkout/{session}     Stripe Checkout: pay · decline · cancel
+    GET/POST /api/v1/billing/fake/stripe/portal/{session}       Customer Portal: cancel at period end,
+                                                                simulate a renewal / a failed renewal
+    GET/POST /api/v1/billing/fake/paypal/approve/{id}           PayPal approval page (subscription / order)
+    GET/POST /api/v1/billing/fake/paypal/manage/{id}            PayPal "automatic payments" page
+    GET      /api/v1/billing/fake/events                        the webhooks delivered so far (debugging)
 
-Whatever happens on the provider side is reported through **webhooks delivered in-process**:
-the fake signs them the way the provider does (Stripe ``Stripe-Signature``; PayPal transmission
-headers that its ``verify-webhook-signature`` endpoint — also faked — confirms) and hands them
-to ``billing.receive_webhook``, i.e. the same path a real delivery takes minus the network.
+When the buyer acts on a page, the fake delivers the webhooks the real provider would send — signed,
+in-process, through ``billing.receive_webhook`` — then redirects like the provider does. Every billing
+state (trialing, active, past_due, canceled, refunded) can be produced locally; nothing leaves the
+machine and nothing is charged. Outside prod only (``config.BILLING_FAKE_PROVIDERS``); every route here
+answers 404 otherwise, and a provider with real credentials never uses its fake.
 
-Amounts are the configured prices (config.PRICE_*): Stripe is charged the ad-hoc price data
-the strategy sends; the fake PayPal plans carry the configured amounts.
-
-Only the handful of endpoints the strategies use are implemented; anything else answers 404.
+The credentials below are obviously not real ("dummy") and are accepted nowhere else. State (checkout
+sessions, subscriptions, charges) lives in memory: after an API restart the fake still accepts refunds
+and cancellations of ids it does not know (the database is the source of truth).
 """
 
+# ruff: noqa: E501  (embedded HTML of the fake provider pages)
 from __future__ import annotations
 
-import base64
+import hashlib
+import hmac
+import html
 import json
 import logging
 import secrets
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 import config
 
 log = logging.getLogger("account.fakes")
 
+FAKE_PREFIX = "/api/v1/billing/fake"
 PERIOD_DAYS = {"pro_monthly": 30, "pro_yearly": 365}
 
 
@@ -50,1266 +55,961 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _iso(dt: datetime | None) -> str | None:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt else None
+def _ts(dt: datetime | None = None) -> int:
+    return int((dt or _now()).timestamp())
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _form(data: bytes | None) -> dict[str, str]:
-    return {k: v[0] for k, v in parse_qs((data or b"").decode(), keep_blank_values=True).items()}
+def _rid(prefix: str, n: int = 12) -> str:
+    return f"{prefix}{secrets.token_hex(n)}"
 
 
-def _json(data: bytes | None) -> dict[str, Any]:
-    try:
-        body = json.loads(data or b"{}")
-    except ValueError:
-        return {}
-    return body if isinstance(body, dict) else {}
+def _esc(value: Any) -> str:
+    return html.escape(str(value if value is not None else ""), quote=True)
 
 
-def _price_cents(plan: str) -> int:
-    import payments
-
-    return payments.plan_price_cents(plan)
+def _with_query(url: str, **params: str) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update(params)
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 def _money(cents: int) -> str:
+    return f"{cents / 100:.2f}"
+
+
+def _safe_redirect(url: str) -> str:
+    """Where a fake page may send the browser: http(s) or a path (what the app passed as return_url)."""
+    if url.startswith(("http://", "https://", "/")) and not url.startswith("//"):
+        return url
+    return "/"
+
+
+# ---------------------------------------------------------------------------- delivery log
+
+
+@dataclass
+class Delivery:
+    provider: str
+    type: str
+    event_id: str
+    at: str
+    result: dict[str, Any] = field(default_factory=dict)
+
+
+EVENTS: deque[Delivery] = deque(maxlen=100)
+
+
+def _deliver(provider: str, body: bytes, headers: dict[str, str], event_type: str, event_id: str) -> dict[str, Any]:
+    """Hand a signed webhook to the real receiving code (billing.receive_webhook), in-process, with a
+    session of its own — exactly what the provider's HTTP delivery would do."""
+    import billing
     import payments
+    from database import SessionLocal
 
-    return payments.money(cents)
-
-
-def _label(plan: str) -> str:
-    return plan.replace("_", " ").title()
-
-
-def _page(title: str, body: str) -> str:
-    return f"""<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>{title}</title>
-<body style="font-family:system-ui;max-width:560px;margin:48px auto;line-height:1.55;padding:0 16px">
-<p style="background:#fff3cd;border:1px solid #ffe69c;padding:8px 12px;border-radius:6px;font-size:14px">
-<strong>Built-in fake.</strong> This page stands in for {title.split(" (")[0]}'s hosted page while no
-credentials are configured (<code>BILLING_FAKE_PROVIDERS</code>). Nothing is charged.</p>
-{body}</body>"""
-
-
-def _button(label: str, action: str, *, primary: bool = False, confirm: str | None = None) -> str:
-    style = "padding:10px 18px;font-size:15px;margin:4px 6px 4px 0;border-radius:6px;cursor:pointer;" + (
-        "background:#5469d4;color:#fff;border:0" if primary else "background:#fff;border:1px solid #999"
-    )
-    onsubmit = f' onsubmit="return confirm({json.dumps(confirm)})"' if confirm else ""
-    return (
-        f'<form method="post" action="{action}" style="display:inline"{onsubmit}>'
-        f'<button style="{style}">{label}</button></form>'
-    )
-
-
-# ---------------------------------------------------------------------------- shared plumbing
-
-
-class _Store:
-    """Persistent dict-of-dicts state for one fake (JSON file, written after every change)."""
-
-    def __init__(self, name: str, tables: tuple[str, ...]):
-        self.name = name
-        self.tables = tables
-        self.data: dict[str, dict[str, Any]] = {t: {} for t in tables}
-        self.loaded = False
-
-    @property
-    def path(self):
-        return config.DATA_DIR / "billing_fakes.json"
-
-    def load(self) -> None:
-        if self.loaded:
-            return
-        self.loaded = True
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8")).get(self.name) or {}
-        except (OSError, ValueError):
-            raw = {}
-        for table in self.tables:
-            self.data[table] = dict(raw.get(table) or {})
-
-    def save(self) -> None:
-        try:
-            config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-            try:
-                whole = json.loads(self.path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                whole = {}
-            whole[self.name] = self.data
-            self.path.write_text(json.dumps(whole, indent=1, default=str), encoding="utf-8")
-        except OSError as exc:  # pragma: no cover - read-only data dir
-            log.warning("could not persist %s fake state: %s", self.name, exc)
-
-    def reset(self) -> None:
-        self.data = {t: {} for t in self.tables}
-        self.loaded = True
-        self.save()
-
-
-class _Webhooks:
-    """Queue of outgoing webhooks; delivered in-process, one at a time, after the action that
-    produced them — a delivery that itself triggers more (PayPal capture) just queues them."""
-
-    def __init__(self):
-        self.pending: list[tuple[str, bytes, dict[str, str]]] = []
-        self.lock = threading.RLock()
-        self.delivering = False
-
-    def emit(self, provider: str, body: bytes, headers: dict[str, str]) -> None:
-        with self.lock:
-            self.pending.append((provider, body, headers))
-            if not self.delivering:
-                self.flush()
-
-    def flush(self) -> None:
-        import billing
-        import payments
-        from database import SessionLocal
-
-        with self.lock:
-            self.delivering = True
-            try:
-                while self.pending:
-                    provider, body, headers = self.pending.pop(0)
-                    method = payments.METHODS[provider]
-                    try:
-                        with SessionLocal() as db:
-                            result = billing.receive_webhook(db, method, body, headers)
-                        log.info("fake %s webhook delivered: %s", provider, result)
-                    except HTTPException as exc:
-                        log.warning("fake %s webhook rejected: %s %s", provider, exc.status_code, exc.detail)
-            finally:
-                self.delivering = False
-
-
-WEBHOOKS = _Webhooks()
+    method = payments.STRIPE if provider == "stripe" else payments.PAYPAL
+    try:
+        with SessionLocal() as db:
+            result = billing.receive_webhook(db, method, body, headers)
+            db.commit()
+    except HTTPException as exc:
+        result = {"ok": False, "status": exc.status_code, "detail": exc.detail}
+        log.warning("fake %s webhook %s was refused: %s", provider, event_type, exc.detail)
+    EVENTS.append(Delivery(provider=provider, type=event_type, event_id=event_id, at=_iso(_now()), result=result))
+    log.info("fake %s webhook %s delivered: %s", provider, event_type, result)
+    return result
 
 
 # ---------------------------------------------------------------------------- Stripe
 
 
 class FakeStripe:
-    """Stripe: Checkout Sessions, Subscriptions, Invoices/Charges, Refunds, Billing Portal,
-    signed events."""
+    """Stripe's REST API (the calls payments.StripePayment makes) and its hosted pages."""
 
-    name = "stripe"
-    secret_key = "sk_test_fake_builtin"
-    webhook_secret = "whsec_fake_builtin"
-    base = "/api/v1/billing/fake/stripe"
+    # Test-mode style key ("sk_test_…": the strategy reports sandbox = True) — a dummy, never valid at Stripe.
+    secret_key = "sk_test_dummy_fake_stripe_key_not_real"
+    webhook_secret = "whsec_dummy_fake_stripe_webhook_secret"
 
-    def __init__(self):
-        self.store = _Store("stripe", ("customers", "subscriptions", "sessions", "charges"))
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.sessions: dict[str, dict[str, Any]] = {}
+        self.subscriptions: dict[str, dict[str, Any]] = {}
+        self.charges: dict[str, dict[str, Any]] = {}  # payment intent id → {amount, refunded, …}
+        self.portals: dict[str, dict[str, Any]] = {}
         self.transport = _StripeTransport(self)
 
-    # ---- state -------------------------------------------------------------------------
+    # ---- webhooks ------------------------------------------------------------------------
 
-    @property
-    def customers(self) -> dict[str, dict[str, Any]]:
-        self.store.load()
-        return self.store.data["customers"]
-
-    @property
-    def subscriptions(self) -> dict[str, dict[str, Any]]:
-        self.store.load()
-        return self.store.data["subscriptions"]
-
-    @property
-    def sessions(self) -> dict[str, dict[str, Any]]:
-        self.store.load()
-        return self.store.data["sessions"]
-
-    @property
-    def charges(self) -> dict[str, dict[str, Any]]:
-        """Keyed by payment intent id (pi_…): what a refund is issued against."""
-        self.store.load()
-        return self.store.data["charges"]
-
-    def reset(self) -> None:
-        self.store.reset()
-
-    def customer_for(self, email: str, account_id: str | None, *, customer_id: str | None = None) -> str:
-        for cid, c in self.customers.items():
-            if c["email"] == email:
-                return cid
-        cid = customer_id or "cus_fake_" + secrets.token_hex(6)
-        self.customers[cid] = {"id": cid, "email": email, "account_id": account_id, "created": int(time.time())}
-        self.store.save()
-        return cid
-
-    def adopt(
-        self,
-        account_id: str,
-        email: str,
-        *,
-        subscription_id: str,
-        customer_id: str,
-        plan: str,
-        status: str,
-        period_end: datetime | None,
-    ) -> None:
-        """Register a subscription that exists in our database (seeded accounts) so the portal,
-        cancel and refund work for it too."""
-        self.customers[customer_id] = {"id": customer_id, "email": email, "account_id": account_id}
-        self.subscriptions[subscription_id] = self._subscription(
-            subscription_id, customer_id, account_id, plan, status, period_end
-        )
-        self.store.save()
-
-    def adopt_charge(
-        self,
-        payment_intent: str,
-        *,
-        customer_id: str,
-        account_id: str,
-        plan: str,
-        amount_cents: int,
-        subscription_id: str | None = None,
-        paid: bool = True,
-    ) -> None:
-        """Register a charge that exists in our ledger (seeded accounts) so it can be refunded."""
-        self.charges[payment_intent] = {
-            "id": "ch_" + payment_intent[3:],
-            "payment_intent": payment_intent,
-            "customer": customer_id,
-            "subscription": subscription_id,
-            "amount": amount_cents,
-            "amount_refunded": 0,
-            "paid": paid,
-            "refunds": [],
-            "metadata": {"account_id": account_id, "plan": plan},
-            "created": int(time.time()),
-        }
-        self.store.save()
-
-    @staticmethod
-    def _subscription(sid, cid, account_id, plan, status, period_end, cancel_at_period_end=False) -> dict[str, Any]:
-        return {
-            "id": sid,
-            "object": "subscription",
-            "customer": cid,
-            "status": status,
-            "plan": plan,
-            "cancel_at_period_end": cancel_at_period_end,
-            "current_period_end": int(period_end.timestamp()) if period_end else None,
-            "ended_at": None,
-            "metadata": {"account_id": account_id, "plan": plan},
-        }
-
-    def _object(self, sub: dict[str, Any]) -> dict[str, Any]:
-        """The subscription as Stripe's current API returns it (period on the item)."""
-        return {
-            **sub,
-            "items": {
-                "data": [
-                    {
-                        "price": {
-                            "unit_amount": _price_cents(sub["plan"]),
-                            "currency": config.BILLING_CURRENCY.lower(),
-                        },
-                        "current_period_end": sub["current_period_end"],
-                    }
-                ]
-            },
-        }
-
-    # ---- events ------------------------------------------------------------------------
-
-    def emit(self, kind: str, obj: dict[str, Any]) -> None:
+    def send(self, kind: str, obj: dict[str, Any]) -> dict[str, Any]:
         import payments
 
-        body = json.dumps(
-            {
-                "id": "evt_fake_" + secrets.token_hex(8),
-                "type": kind,
-                "created": int(time.time()),
-                "data": {"object": obj},
-            }
-        ).encode()
-        WEBHOOKS.emit(
-            "stripe", body, {"Stripe-Signature": payments.StripePayment.sign(body, secret=self.webhook_secret)}
-        )
+        event_id = _rid("evt_dummy_")
+        event = {
+            "id": event_id,
+            "object": "event",
+            "type": kind,
+            "created": _ts(),
+            "livemode": False,
+            "data": {"object": obj},
+        }
+        body = json.dumps(event).encode()
+        headers = {"Stripe-Signature": payments.StripePayment.sign(body, secret=self.webhook_secret)}
+        return _deliver("stripe", body, headers, kind, event_id)
 
-    def _charge(
-        self, cid: str, account_id: str, plan: str, amount: int, *, subscription_id: str | None, paid: bool
-    ) -> dict[str, Any]:
-        pi = "pi_fake_" + secrets.token_hex(8)
-        self.adopt_charge(
-            pi,
-            customer_id=cid,
-            account_id=account_id,
-            plan=plan,
-            amount_cents=amount,
-            subscription_id=subscription_id,
-            paid=paid,
-        )
-        return self.charges[pi]
+    # ---- objects -------------------------------------------------------------------------
 
-    def _invoice(self, sub: dict[str, Any], charge: dict[str, Any], *, paid: bool, period_start: int) -> dict[str, Any]:
-        """An invoice for one subscription period (what invoice.paid / payment_failed carry)."""
+    def _subscription_object(self, sub: dict[str, Any]) -> dict[str, Any]:
         return {
-            "id": "in_fake_" + secrets.token_hex(6),
-            "object": "invoice",
+            "id": sub["id"],
+            "object": "subscription",
+            "status": sub["status"],
             "customer": sub["customer"],
-            "subscription": sub["id"],
-            "payment_intent": charge["payment_intent"],
-            "charge": charge["id"] if paid else None,
-            "amount_due": charge["amount"],
-            "amount_paid": charge["amount"] if paid else 0,
-            "currency": config.BILLING_CURRENCY.lower(),
-            "created": int(time.time()),
-            "status_transitions": {"paid_at": int(time.time()) if paid else None},
-            "last_payment_error": None if paid else {"message": "Your card was declined."},
-            "lines": {"data": [{"period": {"start": period_start, "end": sub["current_period_end"]}}]},
-            "subscription_details": {"metadata": dict(sub["metadata"])},
+            "current_period_start": sub["period_start"],
+            "current_period_end": sub["period_end"],
+            "cancel_at_period_end": sub["cancel_at_period_end"],
+            "ended_at": sub.get("ended_at"),
+            "metadata": dict(sub["metadata"]),
+            "items": {"data": [{"current_period_end": sub["period_end"], "price": {"unit_amount": sub["amount"]}}]},
         }
 
-    # ---- what a buyer / Stripe's scheduler does ------------------------------------------
-
-    def pay_session(self, session_id: str, *, declined: bool = False) -> str:
-        """The buyer paid on the checkout page (or tried with a card that is declined).
-        Returns the URL to send the browser to."""
-        session = self.sessions.get(session_id)
-        if not session or session["status"] != "open":
-            raise HTTPException(status_code=404, detail="Unknown or already completed checkout session.")
-        account_id = session["client_reference_id"]
-        cid = self.customer_for(session["customer_email"], account_id)
-        plan = session["plan"]
-        if session["mode"] == "payment":
-            charge = self._charge(cid, account_id, plan, session["amount"], subscription_id=None, paid=not declined)
-            session.update(
-                {
-                    "status": "complete",
-                    "payment_status": "unpaid" if declined else "paid",
-                    "customer": cid,
-                    "payment_intent": charge["payment_intent"],
-                }
-            )
-            self.store.save()
-            if declined:
-                # A delayed payment method that did not go through: Stripe reports it later.
-                self.emit("checkout.session.async_payment_failed", self._session_object(session))
-                return session["cancel_url"]
-            self.emit("checkout.session.completed", self._session_object(session))
-            return session["success_url"]
-        if declined:
-            return f"{self.base}/checkout/{session_id}/declined"  # the session stays open, nothing happens
-        sid = "sub_fake_" + secrets.token_hex(6)
-        trial_end = session.get("trial_end")
-        if trial_end and trial_end > time.time():
-            status, period_end = "trialing", datetime.fromtimestamp(trial_end, tz=timezone.utc)
-        else:
-            status, period_end = "active", _now() + timedelta(days=PERIOD_DAYS.get(plan, 30))
-        sub = self._subscription(sid, cid, account_id, plan, status, period_end)
-        self.subscriptions[sid] = sub
-        session.update({"status": "complete", "payment_status": "paid", "customer": cid, "subscription": sid})
-        self.store.save()
-        self.emit("customer.subscription.created", self._object(sub))
-        if status == "active":  # the first period is charged right away (a trial is not)
-            charge = self._charge(cid, account_id, plan, session["amount"], subscription_id=sid, paid=True)
-            self.emit("invoice.paid", self._invoice(sub, charge, paid=True, period_start=int(time.time())))
-        self.emit("checkout.session.completed", self._session_object(session))
-        return session["success_url"]
-
-    def _session_object(self, session: dict[str, Any]) -> dict[str, Any]:
+    def _invoice(self, sub: dict[str, Any], *, failed: bool) -> dict[str, Any]:
+        pi = _rid("pi_dummy_")
+        if not failed:
+            self.charges[pi] = {
+                "amount": sub["amount"],
+                "refunded": 0,
+                "currency": sub["currency"],
+                "customer": sub["customer"],
+                "metadata": dict(sub["metadata"]),
+            }
         return {
-            "id": session["id"],
-            "object": "checkout.session",
-            "mode": session["mode"],
-            "payment_status": session["payment_status"],
-            "client_reference_id": session["client_reference_id"],
-            "customer": session.get("customer"),
-            "subscription": session.get("subscription"),
-            "payment_intent": session.get("payment_intent"),
-            "amount_total": session["amount"],
-            "currency": config.BILLING_CURRENCY.lower(),
-            "metadata": {"account_id": session["client_reference_id"], "plan": session["plan"]},
+            "id": _rid("in_dummy_"),
+            "object": "invoice",
+            "subscription": sub["id"],
+            "customer": sub["customer"],
+            "payment_intent": pi,
+            "amount_paid": 0 if failed else sub["amount"],
+            "amount_due": sub["amount"],
+            "currency": sub["currency"],
+            "created": _ts(),
+            "status": "open" if failed else "paid",
+            "status_transitions": {"paid_at": None if failed else _ts()},
+            "lines": {"data": [{"period": {"start": sub["period_start"], "end": sub["period_end"]}}]},
+            "subscription_details": {"metadata": dict(sub["metadata"])},
+            "last_payment_error": {"message": "Your card was declined. (built-in fake)"} if failed else None,
         }
 
-    def cancel_now(self, sid: str) -> None:
-        sub = self._sub(sid)
-        sub.update({"status": "canceled", "cancel_at_period_end": False, "ended_at": int(time.time())})
-        self.store.save()
-        self.emit("customer.subscription.deleted", self._object(sub))
+    # ---- what the hosted pages do --------------------------------------------------------
 
-    def renew(self, sid: str) -> None:
-        """The period ended and Stripe collected the next payment."""
-        sub = self._sub(sid)
-        if sub["status"] == "canceled":
-            raise HTTPException(status_code=409, detail="A canceled subscription does not renew.")
-        start = max(_now(), datetime.fromtimestamp(sub["current_period_end"] or 0, tz=timezone.utc))
-        sub["current_period_end"] = int((start + timedelta(days=PERIOD_DAYS.get(sub["plan"], 30))).timestamp())
-        sub["status"] = "active"
-        self.store.save()
-        charge = self._charge(
-            sub["customer"],
-            sub["metadata"]["account_id"],
-            sub["plan"],
-            _price_cents(sub["plan"]),
-            subscription_id=sid,
-            paid=True,
-        )
-        self.emit("invoice.paid", self._invoice(sub, charge, paid=True, period_start=int(start.timestamp())))
-        self.emit("customer.subscription.updated", self._object(sub))
+    def complete_checkout(self, session_id: str, *, decline: bool) -> str:
+        """The buyer paid (or the card was declined) on the checkout page → webhooks → success URL."""
+        with self.lock:
+            s = self.sessions.get(session_id)
+            if s is None or s["status"] != "open":
+                raise HTTPException(status_code=404, detail="fake: this checkout session is no longer open")
+            s["status"] = "complete"
+            customer = s.get("customer") or _rid("cus_dummy_", 8)
+            s["customer"] = customer
+            meta = dict(s["metadata"])
+            if s["mode"] == "payment":  # Lifetime: a one-off payment
+                pi = _rid("pi_dummy_")
+                if not decline:
+                    self.charges[pi] = {
+                        "amount": s["amount"],
+                        "refunded": 0,
+                        "currency": s["currency"],
+                        "customer": customer,
+                        "metadata": dict(s["payment_intent_metadata"] or meta),
+                    }
+                obj = {
+                    "id": session_id,
+                    "object": "checkout.session",
+                    "mode": "payment",
+                    "payment_status": "unpaid" if decline else "paid",
+                    "payment_intent": pi,
+                    "amount_total": s["amount"],
+                    "currency": s["currency"],
+                    "client_reference_id": s["client_reference_id"],
+                    "customer": customer,
+                    "metadata": meta,
+                }
+                self.send("checkout.session.async_payment_failed" if decline else "checkout.session.completed", obj)
+                return s["cancel_url"] if decline else s["success_url"]
 
-    def fail_payment(self, sid: str) -> None:
-        """The renewal charge failed: Stripe opens dunning (past_due)."""
-        sub = self._sub(sid)
-        if sub["status"] == "canceled":
-            raise HTTPException(status_code=409, detail="A canceled subscription is not charged.")
-        sub["status"] = "past_due"
-        sub["current_period_end"] = int(time.time())  # the paid period is over
-        self.store.save()
-        charge = self._charge(
-            sub["customer"],
-            sub["metadata"]["account_id"],
-            sub["plan"],
-            _price_cents(sub["plan"]),
-            subscription_id=sid,
-            paid=False,
-        )
-        sub["open_invoice_intent"] = charge["payment_intent"]
-        self.store.save()
-        self.emit("invoice.payment_failed", self._invoice(sub, charge, paid=False, period_start=int(time.time())))
-        self.emit("customer.subscription.updated", self._object(sub))
-
-    def recover_payment(self, sid: str) -> None:
-        """The buyer updated the card and the open invoice was paid (same payment intent)."""
-        sub = self._sub(sid)
-        if sub["status"] != "past_due":
-            raise HTTPException(status_code=409, detail="There is no open invoice to pay.")
-        start = _now()
-        sub["status"] = "active"
-        sub["current_period_end"] = int((start + timedelta(days=PERIOD_DAYS.get(sub["plan"], 30))).timestamp())
-        pi = sub.pop("open_invoice_intent", None)
-        charge = self.charges.get(pi) if pi else None
-        if charge is None:
-            charge = self._charge(
-                sub["customer"],
-                sub["metadata"]["account_id"],
-                sub["plan"],
-                _price_cents(sub["plan"]),
-                subscription_id=sid,
-                paid=True,
-            )
-        charge["paid"] = True
-        self.store.save()
-        self.emit("invoice.paid", self._invoice(sub, charge, paid=True, period_start=int(start.timestamp())))
-        self.emit("customer.subscription.updated", self._object(sub))
-
-    def refund(self, payment_intent: str, amount: int | None) -> dict[str, Any]:
-        """POST /v1/refunds (from the API) or "Refund" in the dashboard (portal page)."""
-        charge = self.charges.get(payment_intent)
-        if charge is None or not charge["paid"]:
-            raise HTTPException(status_code=404, detail=f"No such paid charge: {payment_intent}")
-        left = charge["amount"] - charge["amount_refunded"]
-        cents = left if amount is None else amount
-        if cents <= 0 or cents > left:
-            raise HTTPException(status_code=400, detail="Refund amount exceeds what is left to refund.")
-        refund = {"id": "re_fake_" + secrets.token_hex(6), "amount": cents, "created": int(time.time())}
-        charge["amount_refunded"] += cents
-        charge["refunds"].insert(0, refund)
-        self.store.save()
-        self.emit(
-            "charge.refunded",
+            # Pro: a subscription (possibly with the trial carried over).
+            now = _now()
+            sub_meta = dict(s["subscription_metadata"] or meta)
+            plan = sub_meta.get("plan", "pro_monthly")
+            trial_end = s.get("trial_end")
+            period_end = trial_end or _ts(now + timedelta(days=PERIOD_DAYS.get(plan, 30)))
+            sub = {
+                "id": _rid("sub_dummy_"),
+                "customer": customer,
+                "status": "trialing" if trial_end else ("incomplete" if decline else "active"),
+                "period_start": _ts(now),
+                "period_end": period_end,
+                "cancel_at_period_end": False,
+                "metadata": sub_meta,
+                "amount": s["amount"],
+                "currency": s["currency"],
+                "plan": plan,
+            }
+            self.subscriptions[sub["id"]] = sub
+        self.send(
+            "checkout.session.completed",
             {
-                "id": charge["id"],
-                "object": "charge",
-                "payment_intent": payment_intent,
-                "customer": charge["customer"],
-                "amount": charge["amount"],
-                "amount_refunded": charge["amount_refunded"],
-                "refunded": charge["amount_refunded"] >= charge["amount"],
-                "currency": config.BILLING_CURRENCY.lower(),
-                "metadata": dict(charge["metadata"]),
-                "refunds": {"data": list(charge["refunds"])},
+                "id": session_id,
+                "object": "checkout.session",
+                "mode": "subscription",
+                "subscription": sub["id"],
+                "customer": customer,
+                "client_reference_id": s["client_reference_id"],
+                "metadata": meta,
             },
         )
-        return refund
+        self.send("customer.subscription.created", self._subscription_object(sub))
+        if trial_end:
+            return s["success_url"]  # nothing is charged until the trial ends
+        self.send("invoice.payment_failed" if decline else "invoice.paid", self._invoice(sub, failed=decline))
+        return s["cancel_url"] if decline else s["success_url"]
 
-    def _sub(self, sid: str) -> dict[str, Any]:
-        sub = self.subscriptions.get(sid)
-        if not sub:
-            raise HTTPException(status_code=404, detail=f"No such subscription: {sid}")
-        return sub
+    def renew(self, sub_id: str, *, fail: bool) -> None:
+        """Simulate the next billing cycle (or its failure) — the portal's test buttons."""
+        with self.lock:
+            sub = self.subscriptions.get(sub_id)
+            if sub is None or sub["status"] == "canceled":
+                raise HTTPException(status_code=404, detail="fake: no such active subscription")
+            if fail:
+                sub["status"] = "past_due"
+            else:
+                start = max(_ts(), sub["period_start"])
+                sub["period_start"] = start
+                sub["period_end"] = start + PERIOD_DAYS.get(sub["plan"], 30) * 86400
+                sub["status"] = "active"
+            invoice = self._invoice(sub, failed=fail)
+        self.send("invoice.payment_failed" if fail else "invoice.paid", invoice)
+        self.send("customer.subscription.updated", self._subscription_object(sub))
+
+    def set_cancel_at_period_end(self, sub_id: str, value: bool) -> None:
+        with self.lock:
+            sub = self.subscriptions.get(sub_id)
+            if sub is None:
+                raise HTTPException(status_code=404, detail="fake: no such subscription")
+            sub["cancel_at_period_end"] = value
+        self.send("customer.subscription.updated", self._subscription_object(sub))
+
+    def cancel_now(self, sub_id: str) -> dict[str, Any]:
+        with self.lock:
+            sub = self.subscriptions.get(sub_id) or {
+                "id": sub_id,
+                "customer": None,
+                "status": "active",
+                "period_start": _ts(),
+                "period_end": _ts(),
+                "cancel_at_period_end": False,
+                "metadata": {},
+                "amount": 0,
+                "currency": config.BILLING_CURRENCY.lower(),
+                "plan": "pro_monthly",
+            }
+            sub["status"] = "canceled"
+            sub["ended_at"] = _ts()
+            self.subscriptions[sub_id] = sub
+            obj = self._subscription_object(sub)
+        self.send("customer.subscription.deleted", obj)
+        return obj
+
+    def refund(self, payment_id: str, cents: int) -> dict[str, Any]:
+        with self.lock:
+            charge = self.charges.setdefault(
+                payment_id,
+                {"amount": cents, "refunded": 0, "currency": config.BILLING_CURRENCY.lower(), "metadata": {}},
+            )
+            if charge["refunded"] + cents > charge["amount"]:
+                return {"error": {"message": "Refund amount is greater than the unrefunded amount of the charge."}}
+            charge["refunded"] += cents
+            refund_id = _rid("re_dummy_")
+            obj = {
+                "id": _rid("ch_dummy_"),
+                "object": "charge",
+                "payment_intent": payment_id if payment_id.startswith("pi_") else None,
+                "amount": charge["amount"],
+                "amount_refunded": charge["refunded"],
+                "currency": charge["currency"],
+                "customer": charge.get("customer"),
+                "metadata": dict(charge.get("metadata") or {}),
+                "refunds": {"data": [{"id": refund_id, "amount": cents}]},
+            }
+        self.send("charge.refunded", obj)
+        return {"id": refund_id, "object": "refund", "amount": cents, "status": "succeeded"}
 
 
 class _StripeTransport:
-    """Answers the Stripe REST calls payments.StripePayment makes (form-encoded in, JSON out)."""
+    """payments.HttpTransport's shape: ``request(method, url, headers=, data=) → (status, json)``."""
 
-    def __init__(self, fake: FakeStripe):
+    def __init__(self, fake: FakeStripe) -> None:
         self.fake = fake
 
-    def request(self, method: str, url: str, *, headers=None, data: bytes | None = None) -> tuple[int, dict]:
-        if (headers or {}).get("Authorization") != "Bearer " + self.fake.secret_key:
-            return 401, {"error": {"message": "Invalid API Key provided (fake Stripe)."}}
+    def request(self, method: str, url: str, *, headers=None, data: bytes | None = None) -> tuple[int, dict[str, Any]]:
+        headers = {k.lower(): v for k, v in (headers or {}).items()}
+        if headers.get("authorization") != f"Bearer {self.fake.secret_key}":
+            return 401, {"error": {"message": "Invalid API Key provided (built-in fake)."}}
         path = urlsplit(url).path
-        form = _form(data)
+        fields = dict(parse_qsl((data or b"").decode(), keep_blank_values=True))
         f = self.fake
         if method == "POST" and path == "/v1/checkout/sessions":
-            amount = form.get("line_items[0][price_data][unit_amount]")
-            if not amount or not amount.isdigit():
-                return 400, {"error": {"message": "Missing required param: line_items[0][price_data][unit_amount]."}}
-            plan = (
-                "lifetime"
-                if form.get("mode") == "payment"
-                else (
-                    "pro_yearly"
-                    if form.get("line_items[0][price_data][recurring][interval]") == "year"
-                    else "pro_monthly"
-                )
-            )
-            plan = form.get("metadata[plan]") or plan
-            sid = "cs_fake_" + secrets.token_hex(8)
-            f.sessions[sid] = {
-                "id": sid,
+            session_id = _rid("cs_test_dummy_")
+            amount = int(fields.get("line_items[0][price_data][unit_amount]") or 0)
+            trial_end = fields.get("subscription_data[trial_end]")
+            session = {
+                "id": session_id,
+                "mode": fields.get("mode", "payment"),
                 "status": "open",
-                "payment_status": "unpaid",
-                "mode": form.get("mode", "subscription"),
-                "plan": plan,
-                "amount": int(amount),
-                "client_reference_id": form.get("client_reference_id"),
-                "customer_email": form.get("customer_email", ""),
-                "success_url": form.get("success_url", "/"),
-                "cancel_url": form.get("cancel_url", "/"),
-                "trial_end": (
-                    int(form["subscription_data[trial_end]"]) if form.get("subscription_data[trial_end]") else None
-                ),
+                "amount": amount,
+                "currency": fields.get("line_items[0][price_data][currency]", "usd"),
+                "product": fields.get("line_items[0][price_data][product_data][name]", ""),
+                "interval": fields.get("line_items[0][price_data][recurring][interval]"),
+                "success_url": _safe_redirect(fields.get("success_url", "/")),
+                "cancel_url": _safe_redirect(fields.get("cancel_url", "/")),
+                "client_reference_id": fields.get("client_reference_id"),
+                "customer_email": fields.get("customer_email"),
+                "metadata": _nested(fields, "metadata"),
+                "subscription_metadata": _nested(fields, "subscription_data[metadata]"),
+                "payment_intent_metadata": _nested(fields, "payment_intent_data[metadata]"),
+                "trial_end": int(trial_end) if trial_end and trial_end.isdigit() else None,
+                "created": _ts(),
             }
-            f.store.save()
-            return 200, {"id": sid, "object": "checkout.session", "url": f"{f.base}/checkout/{sid}"}
-        if path.startswith("/v1/subscriptions/"):
-            sid = path.rsplit("/", 1)[1]
-            if sid not in f.subscriptions:
-                return 404, {"error": {"message": f"No such subscription: '{sid}'"}}
-            if method == "GET":
-                return 200, f._object(f.subscriptions[sid])
-            if method == "DELETE":
-                f.cancel_now(sid)
-                return 200, f._object(f.subscriptions[sid])
-            if method == "POST":
-                return 200, f._object(f.subscriptions[sid])
+            with f.lock:
+                f.sessions[session_id] = session
+            return 200, {
+                "id": session_id,
+                "object": "checkout.session",
+                "url": f"{FAKE_PREFIX}/stripe/checkout/{session_id}",
+            }
+        if method == "DELETE" and path.startswith("/v1/subscriptions/"):
+            return 200, f.cancel_now(path.rsplit("/", 1)[-1])
         if method == "POST" and path == "/v1/refunds":
-            pi = form.get("payment_intent")
-            if not pi and form.get("charge"):
-                pi = next((p for p, c in f.charges.items() if c["id"] == form["charge"]), None)
-            if not pi or pi not in f.charges:
-                return 404, {"error": {"message": f"No such payment_intent: '{form.get('payment_intent')}'"}}
-            try:
-                refund = f.refund(pi, int(form["amount"]) if form.get("amount") else None)
-            except HTTPException as exc:
-                return exc.status_code, {"error": {"message": str(exc.detail)}}
-            return 200, {"id": refund["id"], "object": "refund", "amount": refund["amount"], "status": "succeeded"}
+            payment_id = fields.get("payment_intent") or fields.get("charge") or ""
+            out = f.refund(payment_id, int(fields.get("amount") or 0))
+            return (400 if "error" in out else 200), out
         if method == "POST" and path == "/v1/billing_portal/sessions":
-            cid = form.get("customer", "")
-            if cid not in f.customers:
-                return 400, {"error": {"message": f"No such customer: '{cid}'"}}
-            query = urlencode({"return_url": form.get("return_url", "/")})
-            return 200, {"id": "bps_fake", "url": f"{f.base}/portal/{cid}?{query}"}
-        return 404, {"error": {"message": f"Unrecognized request URL ({method}: {path}) — fake Stripe"}}
+            portal_id = _rid("bps_dummy_")
+            with f.lock:
+                f.portals[portal_id] = {
+                    "customer": fields.get("customer"),
+                    "return_url": _safe_redirect(fields.get("return_url", "/")),
+                }
+            return 200, {
+                "id": portal_id,
+                "object": "billing_portal.session",
+                "url": f"{FAKE_PREFIX}/stripe/portal/{portal_id}",
+            }
+        return 404, {"error": {"message": f"Unrecognized request URL ({method} {path}) — built-in fake."}}
+
+
+def _nested(fields: dict[str, str], prefix: str) -> dict[str, str]:
+    """``metadata[account_id]=…`` → {"account_id": …} for the given prefix."""
+    out = {}
+    for key, value in fields.items():
+        if key.startswith(prefix + "[") and key.endswith("]"):
+            inner = key[len(prefix) + 1 : -1]
+            if "[" not in inner:
+                out[inner] = value
+    return out
 
 
 # ---------------------------------------------------------------------------- PayPal
 
 
 class FakePayPal:
-    """PayPal: OAuth, Subscriptions API, Orders v2, captures + refunds, webhook-signature
-    verification."""
+    """PayPal's REST API (OAuth, Orders v2, Subscriptions, refunds, webhook verification) and its pages."""
 
-    name = "paypal"
-    client_id = "fake-paypal-client-id"
-    client_secret = "fake-paypal-client-secret"
-    webhook_id = "WH-FAKE-BUILTIN"
-    plan_ids = {"pro_monthly": "P-FAKE-MONTHLY", "pro_yearly": "P-FAKE-YEARLY"}
-    base = "/api/v1/billing/fake/paypal"
+    client_id = "dummy-fake-paypal-client-id"
+    client_secret = "dummy-fake-paypal-client-secret"
+    webhook_id = "DUMMY-FAKE-WEBHOOK-ID"
+    plan_ids = {"pro_monthly": "P-DUMMYFAKEPROMONTHLY", "pro_yearly": "P-DUMMYFAKEPROYEARLY"}
+    access_token = "A21_dummy_fake_paypal_access_token"
 
-    def __init__(self):
-        self.store = _Store("paypal", ("subscriptions", "orders", "captures", "signatures"))
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.orders: dict[str, dict[str, Any]] = {}
+        self.subscriptions: dict[str, dict[str, Any]] = {}
+        self.captures: dict[str, dict[str, Any]] = {}  # capture / sale id → {amount cents, refunded, custom_id, kind}
         self.transport = _PayPalTransport(self)
 
-    @property
-    def subscriptions(self) -> dict[str, dict[str, Any]]:
-        self.store.load()
-        return self.store.data["subscriptions"]
+    # ---- webhooks ------------------------------------------------------------------------
 
-    @property
-    def orders(self) -> dict[str, dict[str, Any]]:
-        self.store.load()
-        return self.store.data["orders"]
+    def signature(self, transmission_id: str, transmission_time: str, event: dict[str, Any]) -> str:
+        digest = hashlib.sha256(json.dumps(event, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        message = f"{transmission_id}|{transmission_time}|{self.webhook_id}|{digest}".encode()
+        return hmac.new(self.client_secret.encode(), message, hashlib.sha256).hexdigest()
 
-    @property
-    def captures(self) -> dict[str, dict[str, Any]]:
-        """Sales (subscription charges) and captures (orders) — what a refund is issued against."""
-        self.store.load()
-        return self.store.data["captures"]
+    def send(self, kind: str, resource: dict[str, Any]) -> dict[str, Any]:
+        event_id = _rid("WH-DUMMY-", 8).upper()
+        event = {
+            "id": event_id,
+            "event_type": kind,
+            "create_time": _iso(_now()),
+            "resource_type": kind.split(".")[1].lower() if "." in kind else "",
+            "resource": resource,
+        }
+        body = json.dumps(event).encode()
+        transmission_id, transmission_time = secrets.token_hex(8), _iso(_now())
+        headers = {
+            "PAYPAL-AUTH-ALGO": "SHA256withRSA",
+            "PAYPAL-CERT-URL": "https://api-m.sandbox.paypal.com/v1/notifications/certs/CERT-DUMMY-FAKE",
+            "PAYPAL-TRANSMISSION-ID": transmission_id,
+            "PAYPAL-TRANSMISSION-SIG": self.signature(transmission_id, transmission_time, event),
+            "PAYPAL-TRANSMISSION-TIME": transmission_time,
+        }
+        return _deliver("paypal", body, headers, kind, event_id)
 
-    @property
-    def signatures(self) -> dict[str, dict[str, Any]]:
-        self.store.load()
-        return self.store.data["signatures"]
+    # ---- objects -------------------------------------------------------------------------
 
-    def reset(self) -> None:
-        self.store.reset()
+    def _subscription_resource(self, sub: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": sub["id"],
+            "status": sub["status"],
+            "plan_id": sub["plan_id"],
+            "custom_id": sub["custom_id"],
+            "start_time": sub["start_time"],
+            "subscriber": {"email_address": sub.get("email"), "payer_id": sub["payer_id"]},
+            "billing_info": {
+                "next_billing_time": sub.get("next_billing_time"),
+                "outstanding_balance": {"currency_code": sub["currency"], "value": _money(sub.get("outstanding", 0))},
+            },
+            "links": [{"rel": "approve", "href": f"{FAKE_PREFIX}/paypal/approve/{sub['id']}"}],
+        }
 
-    def plan_of(self, plan_id: str) -> str:
-        return next((plan for plan, p in self.plan_ids.items() if p == plan_id), "pro_monthly")
+    def manage_url(self, subscription_id: str, return_url: str) -> str:
+        return f"{FAKE_PREFIX}/paypal/manage/{subscription_id}?{urlencode({'return_url': return_url})}"
 
-    def manage_url(self, subscription_id: str | None, return_url: str) -> str | None:
-        if not subscription_id or subscription_id not in self.subscriptions:
-            return None
-        return f"{self.base}/autopay/{subscription_id}?" + urlencode({"return_url": return_url})
+    def _plan_of(self, plan_id: str) -> str:
+        return next((k for k, v in self.plan_ids.items() if v == plan_id), "pro_monthly")
 
-    # ---- events ------------------------------------------------------------------------
+    # ---- what the pages do ---------------------------------------------------------------
 
-    def emit(self, kind: str, resource: dict[str, Any]) -> None:
-        event_id = "WH-FAKE-" + secrets.token_hex(8)
-        body = json.dumps(
-            {"id": event_id, "event_type": kind, "resource": resource, "create_time": _iso(_now())}
-        ).encode()
-        transmission = "fake-tx-" + secrets.token_hex(8)
-        signature = secrets.token_hex(16)
-        self.signatures[transmission] = {"sig": signature, "event_id": event_id}
-        self.store.save()
-        WEBHOOKS.emit(
-            "paypal",
-            body,
+    def approve(self, resource_id: str, *, decline: bool) -> str:
+        import payments
+
+        with self.lock:
+            order = self.orders.get(resource_id)
+            sub = self.subscriptions.get(resource_id)
+        if order is not None:
+            if order["status"] != "CREATED":
+                raise HTTPException(status_code=404, detail="fake: this order is no longer open")
+            if decline:
+                order["status"] = "VOIDED"
+                return order["cancel_url"]
+            order["status"] = "APPROVED"
+            order["payer_id"] = order.get("payer_id") or _rid("DUMMYPAYER", 4).upper()
+            # PayPal tells us the buyer approved; the strategy captures the order from the webhook.
+            self.send(
+                "CHECKOUT.ORDER.APPROVED",
+                {
+                    "id": order["id"],
+                    "status": "APPROVED",
+                    "intent": "CAPTURE",
+                    "purchase_units": order["purchase_units"],
+                    "payer": {"payer_id": order["payer_id"]},
+                },
+            )
+            return _with_query(order["return_url"], token=order["id"], PayerID=order["payer_id"])
+        if sub is None or sub["status"] != "APPROVAL_PENDING":
+            raise HTTPException(status_code=404, detail="fake: this subscription is not waiting for approval")
+        if decline:
+            sub["status"] = "CANCELLED"
+            return sub["cancel_url"]
+        plan = self._plan_of(sub["plan_id"])
+        now = _now()
+        start = datetime.fromisoformat(sub["start_time"].replace("Z", "+00:00")) if sub.get("start_time") else now
+        deferred = start > now + timedelta(minutes=5)  # the trial carried over: the first charge is later
+        with self.lock:
+            sub["status"] = "ACTIVE"
+            sub["payer_id"] = _rid("DUMMYPAYER", 4).upper()
+            sub["next_billing_time"] = _iso(start if deferred else now + timedelta(days=PERIOD_DAYS.get(plan, 30)))
+        self.send("BILLING.SUBSCRIPTION.ACTIVATED", self._subscription_resource(sub))
+        if not deferred:
+            self.sale(sub["id"], payments.plan_price_cents(plan))
+        return _with_query(sub["return_url"], subscription_id=sub["id"], ba_token=_rid("BA-DUMMY", 6).upper())
+
+    def sale(self, sub_id: str, cents: int) -> None:
+        with self.lock:
+            sub = self.subscriptions[sub_id]
+            sale_id = _rid("DUMMYSALE", 6).upper()
+            self.captures[sale_id] = {
+                "amount": cents,
+                "refunded": 0,
+                "currency": sub["currency"],
+                "custom_id": sub["custom_id"],
+                "kind": "sale",
+            }
+        self.send(
+            "PAYMENT.SALE.COMPLETED",
             {
-                "PAYPAL-AUTH-ALGO": "SHA256withRSA",
-                "PAYPAL-CERT-URL": "https://api.sandbox.paypal.com/v1/notifications/certs/fake",
-                "PAYPAL-TRANSMISSION-ID": transmission,
-                "PAYPAL-TRANSMISSION-SIG": signature,
-                "PAYPAL-TRANSMISSION-TIME": _iso(_now()) or "",
+                "id": sale_id,
+                "state": "completed",
+                "billing_agreement_id": sub_id,
+                "amount": {"total": _money(cents), "currency": sub["currency"]},
+                "create_time": _iso(_now()),
             },
         )
 
-    def _resource(self, sub: dict[str, Any]) -> dict[str, Any]:
-        return {k: v for k, v in sub.items() if k not in ("return_url", "cancel_url", "plan")}
-
-    def _money(self, cents: int) -> dict[str, str]:
-        return {"currency_code": config.BILLING_CURRENCY, "value": _money(cents)}
-
-    def _sale(self, sub: dict[str, Any]) -> dict[str, Any]:
-        """One subscription charge (a "sale"): recorded as a capture so it can be refunded."""
-        sale_id = "SALE" + secrets.token_hex(5).upper()
-        cents = _price_cents(sub["plan"])
-        self.captures[sale_id] = {
-            "id": sale_id,
-            "kind": "sale",
-            "status": "COMPLETED",
-            "amount": self._money(cents),
-            "custom_id": sub["custom_id"],
-            "billing_agreement_id": sub["id"],
-            "create_time": _iso(_now()),
-            "refunds": [],
-        }
-        sub["billing_info"]["last_payment"] = {"amount": self._money(cents), "time": _iso(_now())}
-        self.store.save()
-        return self.captures[sale_id]
-
-    # ---- what a buyer / PayPal does ------------------------------------------------------
-
-    def approve_subscription(self, sid: str) -> str:
-        sub = self._sub(sid)
-        if sub["status"] != "APPROVAL_PENDING":
-            raise HTTPException(status_code=409, detail="This subscription was already approved.")
-        start = _parse_iso(sub.get("start_time"))
-        deferred = bool(start and start > _now())
-        sub["status"] = "ACTIVE"
-        sub["subscriber"]["payer_id"] = sub["subscriber"].get("payer_id") or "PAYER" + secrets.token_hex(4).upper()
-        next_billing = start if deferred else _now() + timedelta(days=PERIOD_DAYS.get(sub["plan"], 30))
-        sub["billing_info"] = {"next_billing_time": _iso(next_billing)}
-        self.store.save()
-        self.emit("BILLING.SUBSCRIPTION.ACTIVATED", self._resource(sub))
-        if not deferred:  # the first period is charged right away
-            sale = self._sale(sub)
-            self.emit("PAYMENT.SALE.COMPLETED", {k: v for k, v in sale.items() if k not in ("kind", "refunds")})
-        return sub["return_url"]
-
-    def cancel_subscription(self, sid: str) -> None:
-        sub = self._sub(sid)
-        sub["status"] = "CANCELLED"
-        sub["billing_info"] = {k: v for k, v in sub.get("billing_info", {}).items() if k != "next_billing_time"}
-        self.store.save()
-        self.emit("BILLING.SUBSCRIPTION.CANCELLED", self._resource(sub))
-
-    def renew(self, sid: str) -> None:
-        """PayPal collected the next payment: a sale naming the billing agreement."""
-        sub = self._sub(sid)
-        if sub["status"] != "ACTIVE":
-            raise HTTPException(status_code=409, detail="Only an active subscription renews.")
-        due = _parse_iso(sub["billing_info"].get("next_billing_time")) or _now()
-        start = max(_now(), due)
-        sub["billing_info"]["next_billing_time"] = _iso(start + timedelta(days=PERIOD_DAYS.get(sub["plan"], 30)))
-        self.store.save()
-        sale = self._sale(sub)
-        self.emit("PAYMENT.SALE.COMPLETED", {k: v for k, v in sale.items() if k not in ("kind", "refunds")})
-
-    def fail_payment(self, sid: str) -> None:
-        sub = self._sub(sid)
-        if sub["status"] != "ACTIVE":
-            raise HTTPException(status_code=409, detail="Only an active subscription is charged.")
-        sub["status"] = "SUSPENDED"  # PayPal suspends after failed retries
-        sub["billing_info"]["next_billing_time"] = _iso(_now())
-        sub["billing_info"]["outstanding_balance"] = self._money(_price_cents(sub["plan"]))
-        sub["billing_info"]["failed_payments_count"] = 1
-        self.store.save()
-        self.emit("BILLING.SUBSCRIPTION.PAYMENT.FAILED", self._resource(sub))
-        self.emit("BILLING.SUBSCRIPTION.SUSPENDED", self._resource(sub))
-
-    def recover_payment(self, sid: str) -> None:
-        sub = self._sub(sid)
-        if sub["status"] != "SUSPENDED":
-            raise HTTPException(status_code=409, detail="Only a suspended subscription is re-activated.")
-        sub["status"] = "ACTIVE"
-        sub["billing_info"]["next_billing_time"] = _iso(_now() + timedelta(days=PERIOD_DAYS.get(sub["plan"], 30)))
-        sub["billing_info"].pop("outstanding_balance", None)
-        sub["billing_info"]["failed_payments_count"] = 0
-        self.store.save()
-        self.emit("BILLING.SUBSCRIPTION.RE-ACTIVATED", self._resource(sub))
-        sale = self._sale(sub)
-        self.emit("PAYMENT.SALE.COMPLETED", {k: v for k, v in sale.items() if k not in ("kind", "refunds")})
-
-    def approve_order(self, oid: str, *, declined: bool = False) -> str:
-        order = self._order(oid)
-        if order["status"] != "CREATED":
-            raise HTTPException(status_code=409, detail="This order was already approved.")
-        order["payer"] = {"payer_id": "PAYER" + secrets.token_hex(4).upper()}
-        unit = order["purchase_units"][0]
-        if declined:
-            order["status"] = "VOIDED"
-            capture = {
-                "id": "CAP" + secrets.token_hex(4).upper(),
-                "status": "DECLINED",
-                "amount": unit.get("amount"),
-                "custom_id": unit.get("custom_id"),
-                "create_time": _iso(_now()),
-            }
-            self.store.save()
-            self.emit("PAYMENT.CAPTURE.DENIED", capture)
-            return order["cancel_url"]
-        order["status"] = "APPROVED"
-        self.store.save()
-        # The API captures the order when this arrives (payments.PayPalPayment.parse_webhook).
-        self.emit("CHECKOUT.ORDER.APPROVED", {k: v for k, v in order.items() if k not in ("return_url", "cancel_url")})
-        return order["return_url"]
-
-    def capture_order(self, oid: str) -> tuple[int, dict[str, Any]]:
-        order = self._order(oid)
-        if order["status"] == "COMPLETED":
-            return 422, {"name": "UNPROCESSABLE_ENTITY", "details": [{"issue": "ORDER_ALREADY_CAPTURED"}]}
-        if order["status"] != "APPROVED":
-            return 422, {"name": "UNPROCESSABLE_ENTITY", "details": [{"issue": "ORDER_NOT_APPROVED"}]}
-        order["status"] = "COMPLETED"
-        unit = order["purchase_units"][0]
-        capture = {
-            "id": "CAP" + secrets.token_hex(4).upper(),
-            "kind": "capture",
-            "status": "COMPLETED",
-            "amount": unit.get("amount"),
-            "custom_id": unit.get("custom_id"),
-            "create_time": _iso(_now()),
-            "refunds": [],
-        }
-        self.captures[capture["id"]] = capture
-        public = {k: v for k, v in capture.items() if k not in ("kind", "refunds")}
-        unit["payments"] = {"captures": [public]}
-        self.store.save()
-        self.emit("PAYMENT.CAPTURE.COMPLETED", public)
-        return 201, {
-            "id": oid,
-            "status": "COMPLETED",
-            "payer": order["payer"],
-            "purchase_units": order["purchase_units"],
-        }
-
-    def refund(self, capture_id: str, amount_cents: int | None) -> tuple[int, dict[str, Any]]:
-        """POST /v2/payments/captures/{id}/refund (from the API) or "Refund" at PayPal."""
-        capture = self.captures.get(capture_id)
-        if capture is None or capture["status"] != "COMPLETED":
-            return 404, {"name": "RESOURCE_NOT_FOUND", "message": "The specified resource does not exist."}
+    def renew(self, sub_id: str, *, fail: bool) -> None:
         import payments
 
-        total = payments.to_cents(capture["amount"]["value"])
-        refunded = sum(payments.to_cents(r["amount"]["value"]) for r in capture["refunds"])
-        cents = (total - refunded) if amount_cents is None else amount_cents
-        if cents <= 0 or cents > total - refunded:
-            return 422, {"name": "UNPROCESSABLE_ENTITY", "message": "The refund amount exceeds the remaining amount."}
-        refund = {
-            "id": "REF" + secrets.token_hex(5).upper(),
-            "status": "COMPLETED",
-            "amount": self._money(cents),
-            "custom_id": capture.get("custom_id"),
-            "create_time": _iso(_now()),
-            "links": [{"rel": "up", "href": f"{config.PAYPAL_API_BASE}/v2/payments/captures/{capture_id}"}],
-        }
-        capture["refunds"].insert(0, refund)
-        self.store.save()
-        self.emit("PAYMENT.CAPTURE.REFUNDED" if capture["kind"] == "capture" else "PAYMENT.SALE.REFUNDED", refund)
-        return 201, refund
+        with self.lock:
+            sub = self.subscriptions.get(sub_id)
+            if sub is None or sub["status"] not in ("ACTIVE", "SUSPENDED"):
+                raise HTTPException(status_code=404, detail="fake: no such active subscription")
+            plan = self._plan_of(sub["plan_id"])
+            cents = payments.plan_price_cents(plan)
+            if fail:
+                sub["status"] = "SUSPENDED"
+                sub["outstanding"] = cents
+            else:
+                sub["status"] = "ACTIVE"
+                sub["outstanding"] = 0
+                sub["next_billing_time"] = _iso(_now() + timedelta(days=PERIOD_DAYS.get(plan, 30)))
+        if fail:
+            self.send("BILLING.SUBSCRIPTION.PAYMENT.FAILED", self._subscription_resource(sub))
+            self.send("BILLING.SUBSCRIPTION.SUSPENDED", self._subscription_resource(sub))
+        else:
+            self.send("BILLING.SUBSCRIPTION.RE-ACTIVATED", self._subscription_resource(sub))
+            self.sale(sub_id, cents)
 
-    def _sub(self, sid: str) -> dict[str, Any]:
-        sub = self.subscriptions.get(sid)
-        if not sub:
-            raise HTTPException(status_code=404, detail=f"No such subscription: {sid}")
-        return sub
+    def cancel(self, sub_id: str) -> None:
+        with self.lock:
+            sub = self.subscriptions.get(sub_id)
+            if sub is None:  # unknown after a restart: the database knows the account
+                sub = {
+                    "id": sub_id,
+                    "status": "ACTIVE",
+                    "plan_id": "",
+                    "custom_id": "",
+                    "start_time": _iso(_now()),
+                    "payer_id": None,
+                    "currency": config.BILLING_CURRENCY,
+                }
+                self.subscriptions[sub_id] = sub
+            if sub["status"] == "CANCELLED":
+                return
+            sub["status"] = "CANCELLED"
+        self.send("BILLING.SUBSCRIPTION.CANCELLED", self._subscription_resource(sub))
 
-    def _order(self, oid: str) -> dict[str, Any]:
-        order = self.orders.get(oid)
-        if not order:
-            raise HTTPException(status_code=404, detail=f"No such order: {oid}")
-        return order
+    def capture(self, order_id: str) -> tuple[int, dict[str, Any]]:
+        with self.lock:
+            order = self.orders.get(order_id)
+            if order is None:
+                return 404, {"name": "RESOURCE_NOT_FOUND", "message": "The specified resource does not exist."}
+            if order["status"] == "COMPLETED":
+                return 422, {
+                    "name": "UNPROCESSABLE_ENTITY",
+                    "details": [{"issue": "ORDER_ALREADY_CAPTURED"}],
+                    "message": "Order already captured.",
+                }
+            if order["status"] != "APPROVED":
+                return 422, {"name": "UNPROCESSABLE_ENTITY", "details": [{"issue": "ORDER_NOT_APPROVED"}]}
+            order["status"] = "COMPLETED"
+            unit = order["purchase_units"][0]
+            capture_id = _rid("DUMMYCAPTURE", 5).upper()
+            cents = int(round(float(unit["amount"]["value"]) * 100))
+            self.captures[capture_id] = {
+                "amount": cents,
+                "refunded": 0,
+                "currency": unit["amount"]["currency_code"],
+                "custom_id": unit.get("custom_id"),
+                "kind": "capture",
+            }
+            order["capture_id"] = capture_id
+            return 201, {
+                "id": order_id,
+                "status": "COMPLETED",
+                "payer": {"payer_id": order.get("payer_id")},
+                "purchase_units": [
+                    {
+                        **unit,
+                        "payments": {
+                            "captures": [
+                                {
+                                    "id": capture_id,
+                                    "status": "COMPLETED",
+                                    "amount": unit["amount"],
+                                    "custom_id": unit.get("custom_id"),
+                                    "create_time": _iso(_now()),
+                                }
+                            ]
+                        },
+                    }
+                ],
+            }
+
+    def refund(self, capture_id: str, cents: int, currency: str) -> tuple[int, dict[str, Any]]:
+        with self.lock:
+            cap = self.captures.setdefault(
+                capture_id, {"amount": cents, "refunded": 0, "currency": currency, "custom_id": None, "kind": "capture"}
+            )
+            if cap["refunded"] + cents > cap["amount"]:
+                return 422, {
+                    "name": "UNPROCESSABLE_ENTITY",
+                    "message": "The refund amount exceeds the captured amount.",
+                }
+            cap["refunded"] += cents
+            refund_id = _rid("DUMMYREFUND", 5).upper()
+        kind = "PAYMENT.SALE.REFUNDED" if cap["kind"] == "sale" else "PAYMENT.CAPTURE.REFUNDED"
+        self.send(
+            kind,
+            {
+                "id": refund_id,
+                "status": "COMPLETED",
+                "amount": {"value": _money(cents), "currency_code": currency},
+                "custom_id": cap.get("custom_id"),
+                "links": [{"rel": "up", "href": f"https://api-m.sandbox.paypal.com/v2/payments/captures/{capture_id}"}],
+            },
+        )
+        return 201, {"id": refund_id, "status": "COMPLETED"}
 
 
 class _PayPalTransport:
-    """Answers the PayPal REST calls payments.PayPalPayment makes (JSON in, JSON out)."""
-
-    token = "A21AAFakeAccessToken"
-
-    def __init__(self, fake: FakePayPal):
+    def __init__(self, fake: FakePayPal) -> None:
         self.fake = fake
 
-    def request(self, method: str, url: str, *, headers=None, data: bytes | None = None) -> tuple[int, dict]:
-        headers = headers or {}
-        path = urlsplit(url).path
+    def request(self, method: str, url: str, *, headers=None, data: bytes | None = None) -> tuple[int, dict[str, Any]]:
+        import base64
+
         f = self.fake
+        headers = {k.lower(): v for k, v in (headers or {}).items()}
+        path = urlsplit(url).path
         if method == "POST" and path == "/v1/oauth2/token":
-            expected = base64.b64encode(f"{f.client_id}:{f.client_secret}".encode()).decode()
-            if headers.get("Authorization") != "Basic " + expected:
+            expected = "Basic " + base64.b64encode(f"{f.client_id}:{f.client_secret}".encode()).decode()
+            if headers.get("authorization") != expected:
                 return 401, {
                     "error": "invalid_client",
-                    "error_description": "Client Authentication failed (fake PayPal)",
+                    "error_description": "Client Authentication failed (built-in fake)",
                 }
-            return 200, {"access_token": self.token, "token_type": "Bearer", "expires_in": 32400}
-        if headers.get("Authorization") != "Bearer " + self.token:
-            return 401, {"name": "AUTHENTICATION_FAILURE", "message": "Authentication failed (fake PayPal)."}
-        body = _json(data)
-        if method == "POST" and path == "/v1/billing/subscriptions":
-            plan_id = body.get("plan_id", "")
-            if plan_id not in f.plan_ids.values():
-                return 422, {"name": "UNPROCESSABLE_ENTITY", "message": "The requested plan is not active."}
-            sid = "I-FAKE" + secrets.token_hex(5).upper()
-            context = body.get("application_context") or {}
-            f.subscriptions[sid] = {
-                "id": sid,
-                "plan_id": plan_id,
-                "plan": f.plan_of(plan_id),
-                "status": "APPROVAL_PENDING",
-                "custom_id": body.get("custom_id"),
-                "start_time": body.get("start_time"),
-                "subscriber": {"email_address": (body.get("subscriber") or {}).get("email_address", "")},
-                "billing_info": {},
-                "return_url": context.get("return_url", "/"),
-                "cancel_url": context.get("cancel_url", "/"),
-            }
-            f.store.save()
-            return 201, {
-                "id": sid,
-                "status": "APPROVAL_PENDING",
-                "links": [{"rel": "approve", "href": f"{f.base}/approve/subscription/{sid}"}],
-            }
-        if path.startswith("/v1/billing/subscriptions/"):
-            parts = path.split("/")
-            sid = parts[4]
-            if sid not in f.subscriptions:
-                return 404, {"name": "RESOURCE_NOT_FOUND", "message": "The specified resource does not exist."}
-            if method == "GET" and len(parts) == 5:
-                return 200, f._resource(f.subscriptions[sid])
-            if method == "POST" and parts[-1] == "cancel":
-                if f.subscriptions[sid]["status"] == "CANCELLED":
-                    return 422, {"name": "UNPROCESSABLE_ENTITY", "message": "Subscription already cancelled."}
-                f.cancel_subscription(sid)
-                return 204, {}
+            return 200, {"access_token": f.access_token, "token_type": "Bearer", "expires_in": 32400}
+        if headers.get("authorization") != f"Bearer {f.access_token}":
+            return 401, {"name": "AUTHENTICATION_FAILURE", "message": "Authentication failed (built-in fake)."}
+        try:
+            payload = json.loads(data or b"{}")
+        except ValueError:
+            return 400, {"name": "INVALID_REQUEST", "message": "Request is not well-formed."}
+
         if method == "POST" and path == "/v2/checkout/orders":
-            oid = "ORD" + secrets.token_hex(6).upper()
-            context = body.get("application_context") or {}
-            f.orders[oid] = {
-                "id": oid,
-                "status": "CREATED",
-                "intent": body.get("intent", "CAPTURE"),
-                "purchase_units": body.get("purchase_units") or [{}],
-                "return_url": context.get("return_url", "/"),
-                "cancel_url": context.get("cancel_url", "/"),
-            }
-            f.store.save()
+            order_id = _rid("DUMMYORDER", 6).upper()
+            context = payload.get("application_context") or {}
+            with f.lock:
+                f.orders[order_id] = {
+                    "id": order_id,
+                    "status": "CREATED",
+                    "purchase_units": payload.get("purchase_units") or [],
+                    "return_url": _safe_redirect(context.get("return_url", "/")),
+                    "cancel_url": _safe_redirect(context.get("cancel_url", "/")),
+                }
             return 201, {
-                "id": oid,
+                "id": order_id,
                 "status": "CREATED",
-                "links": [{"rel": "approve", "href": f"{f.base}/approve/order/{oid}"}],
+                "links": [{"rel": "approve", "href": f"{FAKE_PREFIX}/paypal/approve/{order_id}"}],
             }
         if method == "POST" and path.startswith("/v2/checkout/orders/") and path.endswith("/capture"):
-            oid = path.split("/")[4]
-            if oid not in f.orders:
+            return f.capture(path.split("/")[4])
+        if method == "POST" and path == "/v1/billing/subscriptions":
+            if payload.get("plan_id") not in f.plan_ids.values():
+                return 422, {"name": "UNPROCESSABLE_ENTITY", "message": "The plan does not exist (built-in fake)."}
+            sub_id = _rid("I-DUMMY", 5).upper()
+            context = payload.get("application_context") or {}
+            sub = {
+                "id": sub_id,
+                "status": "APPROVAL_PENDING",
+                "plan_id": payload["plan_id"],
+                "custom_id": payload.get("custom_id", ""),
+                "email": (payload.get("subscriber") or {}).get("email_address"),
+                "start_time": payload.get("start_time") or _iso(_now()),
+                "payer_id": None,
+                "currency": config.BILLING_CURRENCY,
+                "return_url": _safe_redirect(context.get("return_url", "/")),
+                "cancel_url": _safe_redirect(context.get("cancel_url", "/")),
+            }
+            with f.lock:
+                f.subscriptions[sub_id] = sub
+            return 201, f._subscription_resource(sub)
+        if method == "GET" and path.startswith("/v1/billing/subscriptions/"):
+            sub = f.subscriptions.get(path.rsplit("/", 1)[-1])
+            if sub is None:
                 return 404, {"name": "RESOURCE_NOT_FOUND", "message": "The specified resource does not exist."}
-            return f.capture_order(oid)
+            return 200, f._subscription_resource(sub)
+        if method == "POST" and path.startswith("/v1/billing/subscriptions/") and path.endswith("/cancel"):
+            f.cancel(path.split("/")[4])
+            return 204, {}
         if method == "POST" and path.startswith("/v2/payments/captures/") and path.endswith("/refund"):
-            import payments
-
-            capture_id = path.split("/")[4]
-            amount = body.get("amount") or {}
-            cents = payments.to_cents(amount["value"]) if amount.get("value") else None
-            return f.refund(capture_id, cents)
+            amount = payload.get("amount") or {}
+            cents = int(round(float(amount.get("value") or 0) * 100))
+            return f.refund(path.split("/")[4], cents, amount.get("currency_code") or config.BILLING_CURRENCY)
         if method == "POST" and path == "/v1/notifications/verify-webhook-signature":
-            issued = f.signatures.get(body.get("transmission_id", ""))
-            ok = (
-                issued is not None
-                and issued["sig"] == body.get("transmission_sig")
-                and body.get("webhook_id") == f.webhook_id
-                and (body.get("webhook_event") or {}).get("id") == issued["event_id"]
+            event = payload.get("webhook_event") or {}
+            ok = payload.get("webhook_id") == f.webhook_id and hmac.compare_digest(
+                str(payload.get("transmission_sig") or ""),
+                f.signature(str(payload.get("transmission_id")), str(payload.get("transmission_time")), event),
             )
             return 200, {"verification_status": "SUCCESS" if ok else "FAILURE"}
-        return 404, {"name": "RESOURCE_NOT_FOUND", "message": f"{method} {path} — fake PayPal"}
+        return 404, {"name": "RESOURCE_NOT_FOUND", "message": f"{method} {path} is not part of the built-in fake."}
 
 
 STRIPE = FakeStripe()
 PAYPAL = FakePayPal()
 
 
-def reset() -> None:
-    STRIPE.reset()
-    PAYPAL.reset()
-
-
-# ---------------------------------------------------------------------------- hosted pages
+# ---------------------------------------------------------------------------- the hosted pages
 
 router = APIRouter(prefix="/billing/fake", include_in_schema=False)
 
 
-def _guard() -> None:
-    if not config.BILLING_FAKE_PROVIDERS or config.IS_PROD:
+def _guard(provider: str) -> None:
+    """404 unless this provider's fake is the one in use (never in prod, never with real credentials)."""
+    import payments
+
+    if config.IS_PROD or not config.BILLING_FAKE_PROVIDERS:
+        raise HTTPException(status_code=404)
+    method = payments.STRIPE if provider == "stripe" else payments.PAYPAL
+    if method.fake is None:
         raise HTTPException(status_code=404)
 
 
-def _fmt_ts(value) -> str:
-    if not value:
-        return "—"
-    dt = datetime.fromtimestamp(value, tz=timezone.utc) if isinstance(value, (int, float)) else _parse_iso(value)
-    return dt.strftime("%Y-%m-%d %H:%M UTC") if dt else "—"
+async def _form(request: Request) -> dict[str, str]:
+    return {k: v[0] for k, v in parse_qs((await request.body()).decode(), keep_blank_values=True).items()}
 
 
-def _cur() -> str:
-    return config.BILLING_CURRENCY
-
-
-def _simulate(provider: str, buttons: list[str]) -> str:
-    """The collapsible "what would the provider do next" block — only while there is something."""
-    if not buttons:
-        return ""
-    return (
-        f'<details style="margin-top:8px"><summary style="cursor:pointer;color:#666">'
-        f"Simulate what {provider} would do next</summary>"
-        f'<div style="margin-top:6px">{"".join(buttons)}</div></details>'
+def _page(title: str, brand: str, body: str) -> HTMLResponse:
+    return HTMLResponse(
+        f"""<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>{_esc(title)} (built-in fake)</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:460px;margin:40px auto;padding:0 16px;line-height:1.5;color:#111827}}
+.note{{background:#fff3cd;border:1px solid #ffe69c;padding:8px 12px;border-radius:8px;font-size:14px}}
+.box{{border:1px solid #e2e5ea;border-radius:10px;padding:12px 14px;margin:14px 0}}
+.amount{{font-size:1.6rem;font-weight:700}} .muted{{color:#6b7280;font-size:.9rem}}
+dl{{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0}} dt{{color:#6b7280}}
+input{{width:100%;box-sizing:border-box;padding:10px 12px;font-size:16px;border:1px solid #e2e5ea;border-radius:8px;margin-top:4px}}
+button{{margin-top:12px;padding:12px 18px;font-size:16px;border-radius:8px;border:0;cursor:pointer;min-height:44px;margin-right:8px}}
+.go{{background:{brand};color:#fff}} .alt{{background:#fff;border:1px solid #999}} .bad{{background:#fff;border:1px solid #b91c1c;color:#b91c1c}}
+</style>
+{body}</html>"""
     )
 
 
-# ---- Stripe
+# ---- Stripe Checkout
 
 
 @router.get("/stripe/checkout/{session_id}", response_class=HTMLResponse)
-def stripe_checkout(session_id: str):
-    _guard()
-    session = STRIPE.sessions.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Unknown checkout session.")
-    if session["status"] != "open":
-        back = session["success_url"] if session["payment_status"] == "paid" else session["cancel_url"]
-        return _page(
-            "Stripe (fake) — Checkout", f'<h2>This checkout is finished</h2><p><a href="{back}">Back to the app</a></p>'
-        )
-    plan = session["plan"]
-    price = _money(session["amount"])
-    what = (
-        "one-off payment"
-        if session["mode"] == "payment"
-        else ("subscription — first charge when the trial ends" if session.get("trial_end") else "subscription")
+def stripe_checkout_page(session_id: str):
+    _guard("stripe")
+    s = STRIPE.sessions.get(session_id)
+    if s is None or s["status"] != "open":
+        raise HTTPException(status_code=404, detail="fake: unknown or finished checkout session")
+    every = f" / {s['interval']}" if s.get("interval") else " once"
+    trial = (
+        f"<p class=muted>Free until {datetime.fromtimestamp(s['trial_end'], tz=timezone.utc):%Y-%m-%d} (your trial carries over) — "
+        "then charged every period.</p>"
+        if s.get("trial_end")
+        else ""
     )
     return _page(
-        "Stripe (fake) — Checkout",
-        f"""<h2>Pay with card</h2>
-<p><strong>{_label(plan)}</strong> · {price} {_cur()} · {what}<br>
-<span style="color:#666">for {session["customer_email"]}</span></p>
-<p><input placeholder="4242 4242 4242 4242" style="padding:8px;width:60%" disabled>
-<input placeholder="MM/YY" style="padding:8px;width:16%" disabled>
-<input placeholder="CVC" style="padding:8px;width:14%" disabled></p>
-{_button(f"Pay {price} {_cur()}", f"{STRIPE.base}/checkout/{session_id}/pay", primary=True)}
-{_button("Pay with a card that is declined", f"{STRIPE.base}/checkout/{session_id}/decline")}
-<p><a href="{session["cancel_url"]}">Cancel and go back</a></p>""",
+        "Stripe Checkout",
+        "#635bff",
+        f"""<h2>Stripe Checkout</h2>
+<p class=note><strong>Built-in fake.</strong> No Stripe keys are configured on this server, so this page stands in for
+Stripe's hosted checkout. Nothing is charged and no card is asked for. "Pay" sends the same signed webhooks
+Stripe would; "Decline" produces a failed payment.</p>
+<div class=box><div class=muted>{_esc(s["product"])}</div>
+<div class=amount id=fake-amount>{_esc(_money(s["amount"]))} {_esc(s["currency"].upper())}<span class=muted>{_esc(every)}</span></div>
+{trial}<div class=muted>{_esc(s.get("customer_email") or "")}</div></div>
+<form method=post action="{FAKE_PREFIX}/stripe/checkout/{_esc(session_id)}">
+<button class=go id=fake-pay name=action value=pay type=submit>Pay</button>
+<button class=bad id=fake-decline name=action value=decline type=submit>Decline (test a failed payment)</button>
+<button class=alt id=fake-cancel name=action value=cancel type=submit>Cancel</button>
+</form>""",
     )
 
 
-@router.post("/stripe/checkout/{session_id}/pay")
-def stripe_checkout_pay(session_id: str):
-    _guard()
-    return RedirectResponse(url=STRIPE.pay_session(session_id), status_code=303)
+@router.post("/stripe/checkout/{session_id}")
+async def stripe_checkout_submit(session_id: str, request: Request):
+    _guard("stripe")
+    action = (await _form(request)).get("action", "pay")
+    s = STRIPE.sessions.get(session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="fake: unknown checkout session")
+    if action == "cancel":
+        s["status"] = "expired"
+        return RedirectResponse(s["cancel_url"], status_code=303)
+    target = STRIPE.complete_checkout(session_id, decline=action == "decline")
+    return RedirectResponse(target, status_code=303)
 
 
-@router.post("/stripe/checkout/{session_id}/decline")
-def stripe_checkout_decline(session_id: str):
-    _guard()
-    return RedirectResponse(url=STRIPE.pay_session(session_id, declined=True), status_code=303)
+# ---- Stripe Customer Portal
 
 
-@router.get("/stripe/checkout/{session_id}/declined", response_class=HTMLResponse)
-def stripe_checkout_declined(session_id: str):
-    _guard()
-    session = STRIPE.sessions.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Unknown checkout session.")
+@router.get("/stripe/portal/{portal_id}", response_class=HTMLResponse)
+def stripe_portal_page(portal_id: str):
+    _guard("stripe")
+    portal = STRIPE.portals.get(portal_id)
+    if portal is None:
+        raise HTTPException(status_code=404, detail="fake: unknown portal session")
+    subs = [s for s in STRIPE.subscriptions.values() if s["customer"] == portal["customer"]]
+    rows = "".join(
+        f"""<div class=box id="fake-sub-{_esc(s["id"])}"><dl>
+<dt>Subscription</dt><dd>{_esc(s["id"])}</dd><dt>Status</dt><dd>{_esc(s["status"])}{
+            " · cancels at period end" if s["cancel_at_period_end"] else ""
+        }</dd>
+<dt>Amount</dt><dd>{_esc(_money(s["amount"]))} {_esc(s["currency"].upper())}</dd>
+<dt>Period ends</dt><dd>{datetime.fromtimestamp(s["period_end"], tz=timezone.utc):%Y-%m-%d}</dd></dl>
+{
+            ""
+            if s["status"] == "canceled"
+            else f'''<form method=post action="{FAKE_PREFIX}/stripe/portal/{_esc(portal_id)}"><input type=hidden name=sub value="{_esc(s["id"])}">
+<button class=alt name=action value={"resume" if s["cancel_at_period_end"] else "cancel_at_period_end"} type=submit id=fake-toggle-cancel>{"Resume renewal" if s["cancel_at_period_end"] else "Cancel at period end"}</button>
+<button class=go name=action value=renew type=submit id=fake-renew>Simulate renewal</button>
+<button class=bad name=action value=fail type=submit id=fake-fail>Simulate failed renewal</button></form>'''
+        }</div>"""
+        for s in subs
+    )
     return _page(
-        "Stripe (fake) — Checkout",
-        f"""<h2 style="color:#b00">Your card was declined</h2>
-<p>Nothing was charged and no subscription was created. You can try another card or go back.</p>
-<p><a href="{STRIPE.base}/checkout/{session_id}">Try again</a> ·
-<a href="{session["cancel_url"]}">Back to the app</a></p>""",
+        "Stripe billing portal",
+        "#635bff",
+        f"""<h2>Billing portal</h2>
+<p class=note><strong>Built-in fake.</strong> Stands in for Stripe's Customer Portal. The test buttons produce the
+webhooks a renewal / a failed renewal would (e.g. to see the "past due" state).</p>
+{rows or "<p class=muted>No subscriptions for this customer (the fake forgets them when the API restarts).</p>"}
+<p><a id=fake-return href="{_esc(portal["return_url"])}">← Return to the app</a></p>""",
     )
 
 
-@router.get("/stripe/portal/{customer_id}", response_class=HTMLResponse)
-def stripe_portal(customer_id: str, return_url: str = "/"):
-    _guard()
-    customer = STRIPE.customers.get(customer_id)
-    if not customer:
-        raise HTTPException(status_code=404, detail="Unknown customer.")
-    back = "?" + urlencode({"return_url": return_url})
-    rows = []
-    for s in (s for s in STRIPE.subscriptions.values() if s["customer"] == customer_id):
-        base = f"{STRIPE.base}/portal/{customer_id}/{s['id']}"
-        actions = []
-        if s["status"] in ("active", "trialing", "past_due"):
-            actions.append(
-                _button("Cancel immediately", f"{base}/cancel-now{back}", confirm="End the subscription now at Stripe?")
-            )
-        simulate = []
-        if s["status"] in ("active", "trialing"):
-            simulate.append(_button("Period ends → renewal collected", f"{base}/renew{back}"))
-            simulate.append(_button("Renewal payment fails (past due)", f"{base}/fail{back}"))
-        if s["status"] == "past_due":
-            simulate.append(_button("Card updated → open invoice paid", f"{base}/recover{back}"))
-        rows.append(
-            f"""<li style="margin-bottom:16px"><strong>{_label(s["plan"])}</strong> ({s["id"]})<br>
-status: {s["status"]}<br>current period ends: {_fmt_ts(s["current_period_end"])}<br>
-<div style="margin-top:6px">{"".join(actions)}</div>{_simulate("Stripe", simulate)}</li>"""
-        )
-    charges = []
-    mine = [c for c in STRIPE.charges.values() if c["customer"] == customer_id]
-    for c in reversed(sorted(mine, key=lambda c: c["created"])):  # newest first, ties by insertion
-        left = c["amount"] - c["amount_refunded"]
-        state = (
-            "failed"
-            if not c["paid"]
-            else (
-                "refunded"
-                if left == 0
-                else (f"refunded {_money(c['amount_refunded'])}" if c["amount_refunded"] else "paid")
-            )
-        )
-        refund = (
-            _button(
-                "Refund in full (dashboard)",
-                f"{STRIPE.base}/portal/{customer_id}/charge/{c['payment_intent']}/refund{back}",
-            )
-            if c["paid"] and left > 0
-            else ""
-        )
-        charges.append(
-            f"""<li>{_fmt_ts(c["created"])} · {_label(c["metadata"].get("plan", ""))} · {_money(c["amount"])} {_cur()}
-· <em>{state}</em> <span style="color:#888">({c["payment_intent"]})</span> {refund}</li>"""
-        )
-    return _page(
-        "Stripe (fake) — Customer portal",
-        f"""<h2>Billing for {customer["email"]}</h2>
-<ul style="list-style:none;padding:0">{"".join(rows) or "<li>No subscriptions.</li>"}</ul>
-<h3>Payments</h3>
-<ul style="padding-left:18px">{"".join(charges) or "<li>No payments yet.</li>"}</ul>
-<p><a href="{return_url}">← Return to Personal Assistant</a></p>""",
-    )
+@router.post("/stripe/portal/{portal_id}")
+async def stripe_portal_submit(portal_id: str, request: Request):
+    _guard("stripe")
+    portal = STRIPE.portals.get(portal_id)
+    if portal is None:
+        raise HTTPException(status_code=404, detail="fake: unknown portal session")
+    form = await _form(request)
+    sub_id, action = form.get("sub", ""), form.get("action", "")
+    sub = STRIPE.subscriptions.get(sub_id)
+    if sub is None or sub["customer"] != portal["customer"]:
+        raise HTTPException(status_code=404, detail="fake: no such subscription for this customer")
+    if action == "renew":
+        STRIPE.renew(sub_id, fail=False)
+    elif action == "fail":
+        STRIPE.renew(sub_id, fail=True)
+    elif action in ("cancel_at_period_end", "resume"):
+        STRIPE.set_cancel_at_period_end(sub_id, action == "cancel_at_period_end")
+    return RedirectResponse(f"{FAKE_PREFIX}/stripe/portal/{portal_id}", status_code=303)
 
 
-@router.post("/stripe/portal/{customer_id}/charge/{payment_intent}/refund")
-def stripe_portal_refund(customer_id: str, payment_intent: str, return_url: str = "/"):
-    """An operator refunding from the Stripe dashboard: only the charge.refunded webhook tells us."""
-    _guard()
-    charge = STRIPE.charges.get(payment_intent)
-    if not charge or charge["customer"] != customer_id:
-        raise HTTPException(status_code=404, detail="Unknown charge.")
-    STRIPE.refund(payment_intent, None)
-    return RedirectResponse(
-        url=f"{STRIPE.base}/portal/{customer_id}?" + urlencode({"return_url": return_url}), status_code=303
-    )
+# ---- PayPal approval + automatic payments
 
 
-@router.post("/stripe/portal/{customer_id}/{subscription_id}/{action}")
-def stripe_portal_action(customer_id: str, subscription_id: str, action: str, return_url: str = "/"):
-    _guard()
-    sub = STRIPE.subscriptions.get(subscription_id)
-    if not sub or sub["customer"] != customer_id:
-        raise HTTPException(status_code=404, detail="Unknown subscription.")
-    actions = {
-        "cancel-now": lambda: STRIPE.cancel_now(subscription_id),
-        "renew": lambda: STRIPE.renew(subscription_id),
-        "fail": lambda: STRIPE.fail_payment(subscription_id),
-        "recover": lambda: STRIPE.recover_payment(subscription_id),
-    }
-    if action not in actions:
-        raise HTTPException(status_code=404)
-    actions[action]()
-    return RedirectResponse(
-        url=f"{STRIPE.base}/portal/{customer_id}?" + urlencode({"return_url": return_url}), status_code=303
-    )
-
-
-# ---- PayPal
-
-
-@router.get("/paypal/approve/subscription/{subscription_id}", response_class=HTMLResponse)
-def paypal_approve_subscription(subscription_id: str):
-    _guard()
-    sub = PAYPAL.subscriptions.get(subscription_id)
-    if not sub:
-        raise HTTPException(status_code=404, detail="Unknown subscription.")
-    if sub["status"] != "APPROVAL_PENDING":
-        return _page(
-            "PayPal (fake)", f'<h2>Already approved</h2><p><a href="{sub["return_url"]}">Back to the app</a></p>'
-        )
-    starts = _parse_iso(sub.get("start_time"))
-    when = (
-        f"first charge on {starts.strftime('%Y-%m-%d')} (after your trial)"
-        if starts and starts > _now()
-        else "first charge today"
-    )
-    plan = sub["plan"]
-    return _page(
-        "PayPal (fake) — Approve subscription",
-        f"""<h2>Agree to automatic payments</h2>
-<p><strong>Personal Assistant — {_label(plan)}</strong> · {_money(_price_cents(plan))} {_cur()} · {when}<br>
-<span style="color:#666">PayPal account: {sub["subscriber"].get("email_address") or "—"}</span></p>
-{_button("Agree & Subscribe", f"{PAYPAL.base}/approve/subscription/{subscription_id}/approve", primary=True)}
-<p><a href="{sub["cancel_url"]}">Cancel and return</a></p>""",
-    )
-
-
-@router.post("/paypal/approve/subscription/{subscription_id}/approve")
-def paypal_approve_subscription_do(subscription_id: str):
-    _guard()
-    return RedirectResponse(url=PAYPAL.approve_subscription(subscription_id), status_code=303)
-
-
-@router.get("/paypal/approve/order/{order_id}", response_class=HTMLResponse)
-def paypal_approve_order(order_id: str):
-    _guard()
-    order = PAYPAL.orders.get(order_id)
-    if not order:
-        raise HTTPException(status_code=404, detail="Unknown order.")
-    if order["status"] != "CREATED":
-        back = order["return_url"] if order["status"] in ("APPROVED", "COMPLETED") else order["cancel_url"]
-        return _page("PayPal (fake)", f'<h2>This order is finished</h2><p><a href="{back}">Back to the app</a></p>')
-    unit = order["purchase_units"][0]
-    amount = unit.get("amount") or {}
-    return _page(
-        "PayPal (fake) — Pay",
-        f"""<h2>Pay now</h2>
-<p><strong>{unit.get("description", "Purchase")}</strong> ·
-{amount.get("currency_code", "")} {amount.get("value", "?")}</p>
-{_button("Pay now", f"{PAYPAL.base}/approve/order/{order_id}/approve", primary=True)}
-{_button("Pay with a funding source that is declined", f"{PAYPAL.base}/approve/order/{order_id}/decline")}
-<p><a href="{order["cancel_url"]}">Cancel and return</a></p>""",
-    )
-
-
-@router.post("/paypal/approve/order/{order_id}/approve")
-def paypal_approve_order_do(order_id: str):
-    _guard()
-    return RedirectResponse(url=PAYPAL.approve_order(order_id), status_code=303)
-
-
-@router.post("/paypal/approve/order/{order_id}/decline")
-def paypal_approve_order_decline(order_id: str):
-    _guard()
-    return RedirectResponse(url=PAYPAL.approve_order(order_id, declined=True), status_code=303)
-
-
-@router.get("/paypal/autopay/{subscription_id}", response_class=HTMLResponse)
-def paypal_autopay(subscription_id: str, return_url: str = "/"):
-    _guard()
-    sub = PAYPAL.subscriptions.get(subscription_id)
-    if not sub:
-        raise HTTPException(status_code=404, detail="Unknown subscription.")
-    base = f"{PAYPAL.base}/autopay/{subscription_id}"
-    back = "?" + urlencode({"return_url": return_url})
-    actions = []
-    if sub["status"] in ("ACTIVE", "SUSPENDED"):
-        actions.append(
-            _button("Cancel automatic payments", f"{base}/cancel{back}", confirm="Cancel this subscription at PayPal?")
-        )
-    simulate = []
-    if sub["status"] == "ACTIVE":
-        simulate.append(_button("Next payment collected", f"{base}/renew{back}"))
-        simulate.append(_button("Payment fails (suspended)", f"{base}/fail{back}"))
-    if sub["status"] == "SUSPENDED":
-        simulate.append(_button("Funding fixed → re-activated", f"{base}/recover{back}"))
-    sales = []
-    mine = [c for c in PAYPAL.captures.values() if c.get("billing_agreement_id") == subscription_id]
-    for c in reversed(sorted(mine, key=lambda c: c["create_time"])):  # newest first, ties by insertion
+@router.get("/paypal/approve/{resource_id}", response_class=HTMLResponse)
+def paypal_approve_page(resource_id: str):
+    _guard("paypal")
+    order = PAYPAL.orders.get(resource_id)
+    sub = PAYPAL.subscriptions.get(resource_id)
+    if order is not None and order["status"] == "CREATED":
+        unit = (order["purchase_units"] or [{}])[0]
+        what = _esc(unit.get("description") or "Order")
+        amount = f"{_esc(unit.get('amount', {}).get('value'))} {_esc(unit.get('amount', {}).get('currency_code'))}"
+        every = " once"
+    elif sub is not None and sub["status"] == "APPROVAL_PENDING":
         import payments
 
-        total = payments.to_cents(c["amount"]["value"])
-        refunded = sum(payments.to_cents(r["amount"]["value"]) for r in c["refunds"])
-        state = "refunded" if refunded >= total else (f"refunded {_money(refunded)}" if refunded else "completed")
-        refund = (
-            _button(
-                "Refund in full (PayPal)", f"{PAYPAL.base}/autopay/{subscription_id}/capture/{c['id']}/refund{back}"
-            )
-            if refunded < total
-            else ""
-        )
-        sales.append(
-            f"""<li>{_fmt_ts(c["create_time"])} · {c["amount"]["value"]} {c["amount"]["currency_code"]} ·
-<em>{state}</em> <span style="color:#888">({c["id"]})</span> {refund}</li>"""
-        )
+        plan = PAYPAL._plan_of(sub["plan_id"])
+        what = _esc(payments.PLAN_TITLES.get(plan, plan))
+        amount = f"{_esc(_money(payments.plan_price_cents(plan)))} {_esc(sub['currency'])}"
+        every = " / month" if plan == "pro_monthly" else " / year"
+    else:
+        raise HTTPException(status_code=404, detail="fake: nothing to approve here")
     return _page(
-        "PayPal (fake) — Automatic payments",
-        f"""<h2>Personal Assistant — {_label(sub["plan"])}</h2>
-<p>status: {sub["status"]}<br>next payment: {_fmt_ts(sub.get("billing_info", {}).get("next_billing_time"))}</p>
-<div>{"".join(actions)}</div>{_simulate("PayPal", simulate)}
-<h3>Payments</h3>
-<ul style="padding-left:18px">{"".join(sales) or "<li>No payments yet.</li>"}</ul>
-<p><a href="{return_url}">← Return to Personal Assistant</a></p>""",
+        "PayPal",
+        "#0070ba",
+        f"""<h2>PayPal</h2>
+<p class=note><strong>Built-in fake.</strong> No PayPal credentials are configured on this server, so this page stands
+in for PayPal's approval screen. Nothing is charged; approving sends the webhooks PayPal would.</p>
+<div class=box><div class=muted>{what}</div><div class=amount id=fake-amount>{amount}<span class=muted>{every}</span></div>
+<div class=muted>Paying as dummy-buyer@example.com (sandbox)</div></div>
+<form method=post action="{FAKE_PREFIX}/paypal/approve/{_esc(resource_id)}">
+<button class=go id=fake-approve name=action value=approve type=submit>Agree &amp; pay</button>
+<button class=alt id=fake-cancel name=action value=cancel type=submit>Cancel and return</button>
+</form>""",
     )
 
 
-@router.post("/paypal/autopay/{subscription_id}/capture/{capture_id}/refund")
-def paypal_autopay_refund(subscription_id: str, capture_id: str, return_url: str = "/"):
-    """A refund issued at PayPal itself: only the PAYMENT.SALE.REFUNDED webhook tells us."""
-    _guard()
-    PAYPAL._sub(subscription_id)
-    status, body = PAYPAL.refund(capture_id, None)
-    if status >= 400:
-        raise HTTPException(status_code=status, detail=body.get("message", "refund failed"))
-    return RedirectResponse(
-        url=f"{PAYPAL.base}/autopay/{subscription_id}?" + urlencode({"return_url": return_url}), status_code=303
+@router.post("/paypal/approve/{resource_id}")
+async def paypal_approve_submit(resource_id: str, request: Request):
+    _guard("paypal")
+    action = (await _form(request)).get("action", "approve")
+    target = PAYPAL.approve(resource_id, decline=action != "approve")
+    return RedirectResponse(target, status_code=303)
+
+
+@router.get("/paypal/manage/{subscription_id}", response_class=HTMLResponse)
+def paypal_manage_page(subscription_id: str, return_url: str = "/"):
+    _guard("paypal")
+    sub = PAYPAL.subscriptions.get(subscription_id)
+    back = _safe_redirect(return_url)
+    if sub is None:
+        info = "<p class=muted>The fake does not know this subscription (it forgets them when the API restarts).</p>"
+    else:
+        live = sub["status"] in ("ACTIVE", "SUSPENDED")
+        info = f"""<div class=box><dl><dt>Subscription</dt><dd>{_esc(sub["id"])}</dd><dt>Status</dt><dd>{
+            _esc(sub["status"])
+        }</dd>
+<dt>Next payment</dt><dd>{_esc(sub.get("next_billing_time") or "—")}</dd></dl>
+{
+            ""
+            if not live
+            else f'''<form method=post action="{FAKE_PREFIX}/paypal/manage/{_esc(subscription_id)}"><input type=hidden name=return_url value="{_esc(back)}">
+<button class=go name=action value=renew type=submit id=fake-renew>Simulate next payment</button>
+<button class=bad name=action value=fail type=submit id=fake-fail>Simulate failed payment</button>
+<button class=alt name=action value=cancel type=submit id=fake-cancel-sub>Cancel automatic payments</button></form>'''
+        }</div>"""
+    return _page(
+        "PayPal automatic payments",
+        "#0070ba",
+        f"""<h2>Automatic payments</h2>
+<p class=note><strong>Built-in fake.</strong> Stands in for PayPal's "automatic payments" page.</p>
+{info}<p><a id=fake-return href="{_esc(back)}">← Return to the app</a></p>""",
     )
 
 
-@router.post("/paypal/autopay/{subscription_id}/{action}")
-def paypal_autopay_action(subscription_id: str, action: str, return_url: str = "/"):
-    _guard()
-    PAYPAL._sub(subscription_id)
-    actions = {
-        "cancel": lambda: PAYPAL.cancel_subscription(subscription_id),
-        "renew": lambda: PAYPAL.renew(subscription_id),
-        "fail": lambda: PAYPAL.fail_payment(subscription_id),
-        "recover": lambda: PAYPAL.recover_payment(subscription_id),
-    }
-    if action not in actions:
+@router.post("/paypal/manage/{subscription_id}")
+async def paypal_manage_submit(subscription_id: str, request: Request):
+    _guard("paypal")
+    form = await _form(request)
+    action = form.get("action", "")
+    if action == "renew":
+        PAYPAL.renew(subscription_id, fail=False)
+    elif action == "fail":
+        PAYPAL.renew(subscription_id, fail=True)
+    elif action == "cancel":
+        PAYPAL.cancel(subscription_id)
+    back = urlencode({"return_url": _safe_redirect(form.get("return_url", "/"))})
+    return RedirectResponse(f"{FAKE_PREFIX}/paypal/manage/{subscription_id}?{back}", status_code=303)
+
+
+@router.get("/events")
+def fake_events():
+    """The webhooks the fakes delivered (newest first) and what the receiving code answered."""
+    if config.IS_PROD or not config.BILLING_FAKE_PROVIDERS:
         raise HTTPException(status_code=404)
-    actions[action]()
-    return RedirectResponse(
-        url=f"{PAYPAL.base}/autopay/{subscription_id}?" + urlencode({"return_url": return_url}), status_code=303
+    return JSONResponse(
+        {
+            "events": [
+                {"provider": e.provider, "type": e.type, "event_id": e.event_id, "at": e.at, "result": e.result}
+                for e in reversed(EVENTS)
+            ],
+            "stripe": {"secret_key": STRIPE.secret_key[:12] + "…", "sessions": len(STRIPE.sessions)},
+            "paypal": {"client_id": PAYPAL.client_id, "subscriptions": len(PAYPAL.subscriptions)},
+            "time": time.time(),
+        }
     )

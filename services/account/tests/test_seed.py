@@ -1,132 +1,144 @@
-"""Fake accounts for testing: real accounts, one per membership situation, idempotent."""
+"""The dummy data (seed.py) and the public flows of the staff dashboard that use it."""
+
+from __future__ import annotations
 
 import re
+from datetime import date
 
 import pytest
-from conftest import headers
-
-import clientcrypto
-import database
-import messaging
-import models
-import seed
-import totp
-
-FAST = 1000  # PBKDF2 iterations for tests (the real seed uses the PWA's pinned 600k)
+from helpers import login
 
 
-def _login(client, spec: seed.FakeAccount, iterations=FAST, code: str | None = None):
-    auth_key, wrap_key = clientcrypto.derive_keys(spec.password, spec.email, iterations)
-    r = client.post(
-        "/api/v1/auth/login", json={"email": spec.email, "auth_key": auth_key, "device": {"platform": "test"}}
+@pytest.fixture(scope="module")
+def everything(client):
+    import seed
+    from database import SessionLocal
+
+    with SessionLocal() as db:
+        seed.seed_all(db)
+        seed.seed_all(db)  # idempotent: a second run adds nothing
+    return seed
+
+
+def test_everything_is_dummy_and_created_once(client, everything):
+    import models
+    from database import SessionLocal
+
+    with SessionLocal() as db:
+        emails = [a.email for a in db.query(models.Account).all() if a.email.endswith("@example.com")]
+        seeded = [everything.email_for(k) for k in everything.KINDS + everything.STAFF_KINDS]
+        assert set(seeded) <= set(emails)
+        assert all("dummy" in e for e in seeded)
+        assert all("Dummy" in everything.password_for(k) for k in everything.KINDS)
+        assert db.query(models.Worker).filter(models.Worker.email_norm.like("dummy-%")).count() == 5
+        assert db.query(models.AdCampaign).count() == len(everything.CAMPAIGNS)
+        pat = db.query(models.Patient).filter_by(email_norm=everything.email_for("patient")).one()
+        cards = db.query(models.PatientPaymentMethod).filter_by(account_id=pat.account_id, kind="card").all()
+        assert len(cards) == 1 and cards[0].card_last4 == "4242" and cards[0].status == "active"
+        for w in db.query(models.Worker).filter(models.Worker.phone.is_not(None)):
+            assert re.search(r"555 010 0\d{3}$", w.phone), w.phone  # the range reserved for fiction
+        reasons = {
+            a.reason
+            for a in db.query(models.Appointment).filter_by(patient_id=pat.id, status="scheduled")
+            if a.end_at > models.utcnow()
+        }
+        assert {everything.CHECKUP_REASON, everything.FOLLOW_UP_REASON} <= reasons
+
+
+def test_the_dummy_accounts_sign_in(client, everything):
+    for kind in ("admin", "doctor", "nurse", "assistant", "assistant2", "pro"):
+        assert login(client, kind)["Authorization"].startswith("Bearer ")
+    me = client.get("/api/v1/me", headers=login(client, "admin")).json()
+    assert me["role"] == "admin"
+
+
+def test_the_two_factor_account_needs_a_code(client, everything):
+    import clientcrypto
+    import totp
+
+    auth_key, _ = clientcrypto.derive_keys(everything.password_for("twofa"), everything.email_for("twofa"))
+    res = client.post("/api/v1/auth/login", json={"email": everything.email_for("twofa"), "auth_key": auth_key})
+    assert res.status_code == 202 and res.json()["two_factor_required"]
+    challenge = res.json()["challenge"]
+    code = totp.code_at(everything.TWOFA_SECRET)
+    res = client.post("/api/v1/auth/login/2fa", json={"challenge": challenge, "code": code})
+    assert res.status_code == 200, res.text
+
+
+def test_a_member_of_staff_creates_their_account_with_the_code_from_the_inbox(client, everything):
+    """What the staff dashboard's "Create staff account" page does (the front-desk record has no account)."""
+    import clientcrypto
+    import messaging
+
+    email = everything.email_for("frontdesk")
+    sent = client.post("/api/v1/staff/account/verify", json={"staff_number": "W-000003", "email": email})
+    assert sent.status_code == 200, sent.text
+    assert sent.json()["fake"] is True and sent.json()["outbox_url"] == "/api/v1/messages/fake/outbox"
+    code = re.search(r"\b(\d{6})\b", messaging.OUTBOX.latest(to=email)["body"]).group(1)
+    auth_key, _ = clientcrypto.derive_keys("Dummy-Frontdesk-pass-123", email)
+    res = client.post(
+        "/api/v1/staff/account",
+        json={
+            "enrollment": sent.json()["enrollment"],
+            "code": code,
+            "auth_key": auth_key,
+            "wrapped_data_key": "dummy-wrapped-data-key",
+            "device": {"platform": "staff-dashboard"},
+        },
     )
-    if spec.totp_secret or spec.phone or spec.email_codes:
-        # The 2FA fixtures: password → challenge → authenticator code / the code the fake
-        # "texted" or "e-mailed" (test inbox) / a recovery code.
-        assert r.status_code == 202, (spec.email, r.text)
-        if code is None and spec.totp_secret:
-            code = totp.code_at(spec.totp_secret)
-        elif code is None:
-            to = spec.phone or spec.email
-            code = re.search(r"\b(\d{6})\b", messaging.OUTBOX.latest(to=to)["body"]).group(1)
-        r = client.post("/api/v1/auth/login/2fa", json={"challenge": r.json()["challenge"], "code": code})
-    assert r.status_code == 200, (spec.email, r.text)
-    return r.json(), wrap_key
+    assert res.status_code == 201, res.text
+    staff = client.get("/api/v1/staff/me", headers={"Authorization": f"Bearer {res.json()['token']}"}).json()
+    assert staff["worker"]["staff_number"] == "W-000003" and staff["worker"]["role"] == "receptionist"
+    # A wrong staff number / e-mail pair gives nothing away.
+    bad = client.post("/api/v1/staff/account/verify", json={"staff_number": "W-000001", "email": email})
+    assert bad.status_code == 404
 
 
-def test_seed_creates_one_account_per_membership_and_they_can_sign_in(client):
-    with database.SessionLocal() as db:
-        result = seed.seed(db, iterations=FAST)
-    assert all(created for _, _, created in result)
-    assert {spec.membership for spec in seed.FAKE_ACCOUNTS} == {"free", "paid", "admin"}
-
-    for spec in seed.FAKE_ACCOUNTS:
-        session, wrap_key = _login(client, spec)
-        # The device can unwrap the data key with the key derived from the password → sync works.
-        assert len(clientcrypto.unwrap_data_key(session["wrapped_data_key"], wrap_key)) == 32
-        assert session["kdf_params"]["iterations"] == FAST
-        me = client.get("/api/v1/me", headers=headers(session)).json()
-        assert me["entitlements"]["membership"] == spec.membership, spec.email
-        assert me["role"] == spec.role
-        if spec.membership == "free":
-            assert me["entitlements"]["max_active_tasks"] == 3
-            assert client.get("/api/v1/sync/status", headers=headers(session)).status_code == 402
-        else:
-            assert me["entitlements"]["max_active_tasks"] is None
-            assert client.get("/api/v1/sync/status", headers=headers(session)).status_code == 200
-
-    free = client.get("/api/v1/me/entitlements", headers=headers(_login(client, seed.FAKE_ACCOUNTS[0])[0])).json()
-    assert free["trial_available"] is True
-    expired = next(s for s in seed.FAKE_ACCOUNTS if s.email.startswith("expired"))
-    ent = client.get("/api/v1/me/entitlements", headers=headers(_login(client, expired)[0])).json()
-    assert ent["status"] == "canceled" and ent["trial_available"] is False and ent["plan"] == "free"
+def test_availability_by_staff_number_and_work_email(client, everything):
+    creds = {"staff_number": "W-000005", "email": everything.email_for("assistant2")}
+    week = client.post("/api/v1/workers/availability/lookup", json=creds)
+    assert week.status_code == 200, week.text
+    days = week.json()["availability"]
+    assert [d["available"] for d in days] == [True, True, True, True, False, False, False]  # Mon–Thu afternoons
+    assert days[0]["start_time"].startswith("13:00")
+    days[4] = {**days[4], "available": True}
+    saved = client.put("/api/v1/workers/availability", json={**creds, "availability": days})
+    assert saved.status_code == 200 and saved.json()["availability"][4]["available"] is True
+    signed_in = client.get("/api/v1/staff/me/availability", headers=login(client, "assistant2"))
+    assert signed_in.status_code == 200 and signed_in.json()["availability"][4]["available"] is True
 
 
-def test_seed_is_idempotent_and_resets_membership_state(client):
-    with database.SessionLocal() as db:
-        seed.seed(db, iterations=FAST)
-        pro = db.query(models.Account).filter_by(email="pro@example.com").one()
-        sub = db.get(models.Subscription, pro.id)
-        sub.status = "canceled"  # somebody played with it
-        db.commit()
-        result = seed.seed(db, iterations=FAST)
-        assert not any(created for _, _, created in result)
-        db.refresh(sub)
-        assert sub.status == "active" and db.query(models.Account).count() == len(seed.FAKE_ACCOUNTS)
+def test_apply_and_check_the_status(client, everything):
+    body = {
+        "first_name": "Dummy",
+        "last_name": "Candidate",
+        "email": "dummy-candidate@example.com",
+        "date_of_birth": "1992-02-02",
+        "role": "nurse",
+        "license_number": "DUMMY-RN-9999",
+        "license_expires": date(date.today().year + 2, 1, 1).isoformat(),
+        "background_consent": True,
+        "consent": True,
+    }
+    receipt = client.post("/api/v1/applications", json=body)
+    assert receipt.status_code == 201, receipt.text
+    r = receipt.json()
+    assert r["age_check"] == "passed" and r["license_check"] == "in_progress" and r["number"].startswith("A-")
+    status = client.post("/api/v1/applications/status", json={"number": r["number"], "email": body["email"]})
+    assert status.status_code == 200 and status.json()["status"] == "screening"
 
 
-def test_seed_two_factor_fixture_and_reset_of_the_others(client):
-    with database.SessionLocal() as db:
-        seed.seed(db, iterations=FAST)
-    twofa = next(s for s in seed.FAKE_ACCOUNTS if s.email == "twofa@example.com")
-    free = seed.FAKE_ACCOUNTS[0]
-    # The text-message and e-mail fixtures sign in with the code the fake delivered.
-    for email, method in (("twofa-sms@example.com", "sms"), ("twofa-email@example.com", "email")):
-        spec = next(s for s in seed.FAKE_ACCOUNTS if s.email == email)
-        session, _ = _login(client, spec)
-        assert client.get("/api/v1/me/2fa", headers=headers(session)).json()["methods"] == [method]
-    # Documented state: the fixture has 2FA on with the fixed secret and ten recovery codes.
-    session, _ = _login(client, twofa)
-    status = client.get("/api/v1/me/2fa", headers=headers(session)).json()
-    assert status["enabled"] is True and status["recovery_codes_left"] == 10
-    session, _ = _login(client, twofa, code="TWOFA-00007")  # recovery codes work (once)
-    assert client.get("/api/v1/me/2fa", headers=headers(session)).json()["recovery_codes_left"] == 9
-    # Somebody turned 2FA on for free@ and used a twofa@ code: re-seeding restores the documented state.
-    with database.SessionLocal() as db:
-        acc = db.query(models.Account).filter_by(email=free.email).one()
-        acc.totp_secret = "JBSWY3DPEHPK3PXP"
-        db.commit()
-        seed.seed(db, iterations=FAST)
-        acc = db.query(models.Account).filter_by(email=free.email).one()
-        assert acc.totp_secret is None and acc.recovery_codes == "[]"
-    session, _ = _login(client, free)  # password only again
-    session, _ = _login(client, twofa, code="twofa-00007")
-    assert client.get("/api/v1/me/2fa", headers=headers(session)).json()["recovery_codes_left"] == 9
-
-
-def test_seed_refuses_prod_and_can_promote(client, monkeypatch, capsys):
-    import config
-
-    monkeypatch.setattr(config, "ENV", "prod")
-    assert seed.main([]) == 2
-    monkeypatch.setattr(config, "ENV", "test")
-    with pytest.raises(SystemExit):
-        seed.main(["--promote", "nobody@example.com"])
-    with database.SessionLocal() as db:
-        seed.seed(db, iterations=FAST)
-    assert seed.main(["--promote", "free@example.com"]) == 0
-    assert "free@example.com: role = admin" in capsys.readouterr().out
-    with database.SessionLocal() as db:
-        assert db.query(models.Account).filter_by(email="free@example.com").one().role == "admin"
-    assert seed.main(["--demote", "free@example.com"]) == 0
-    with database.SessionLocal() as db:
-        assert db.query(models.Account).filter_by(email="free@example.com").one().role == "user"
-
-
-def test_client_crypto_matches_the_pwa_key_derivation():
-    """Known-answer test computed with WebCrypto (Node 22) for crypto.ts → deriveKeys().
-    If this fails, seeded accounts can no longer sign in from the app."""
-    auth_key, wrap_key = clientcrypto.derive_keys("correct horse battery", "Ann@Example.com ")
-    assert auth_key == "c3cb2a5368f61af3b9ccea859de3f015476777b3f519ec199d72d6df8b837c8d"
-    wrapped = "AAECAwQFBgcICQoLmdO6bwtNVRHUwO83j4WR7UxIRDPgaEajDSDE7bqP760WqKAmbJAcT2QMv4N1tOV/"
-    assert clientcrypto.unwrap_data_key(wrapped, wrap_key) == bytes(range(32))
+def test_the_pharmacy_directory(client, everything, admin_headers):
+    rows = client.get("/api/v1/pharmacies", headers=admin_headers).json()
+    assert {p["source"] for p in rows} == {"seed"} and any(p["email"] is None for p in rows)
+    new = client.post(
+        "/api/v1/pharmacies",
+        headers=admin_headers,
+        json={"name": "Dummy Test Pharmacy", "email": "dummy-test-pharmacy@example.com"},
+    )
+    assert new.status_code == 201
+    off = client.patch(f"/api/v1/pharmacies/{new.json()['id']}", headers=admin_headers, json={"active": False})
+    assert off.json()["active"] is False
+    active = [p["name"] for p in client.get("/api/v1/pharmacies", headers=admin_headers).json()]
+    everyone = client.get("/api/v1/pharmacies?include_inactive=true", headers=admin_headers).json()
+    assert "Dummy Test Pharmacy" not in active and "Dummy Test Pharmacy" in [p["name"] for p in everyone]

@@ -11,7 +11,7 @@ import { UpdateService } from './update.service';
   template: `
     <dialog appDialog id="update-dialog" aria-labelledby="update-dialog-title">
       <form (submit)="$event.preventDefault()">
-        <h3 id="update-dialog-title">Update Personal Assistant</h3>
+        <h3 id="update-dialog-title">Update Medic Office management</h3>
         <p class="muted small">
           New versions are published to the cloud. This app checks for them when you open it and
           every few hours, downloads them in the background and — by default — installs them as soon

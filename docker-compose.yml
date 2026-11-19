@@ -1,133 +1,77 @@
-# Everything on one machine: PostgreSQL + the service (which also serves the built PWA).
-#   docker compose up --build          → http://localhost:8000/
-# Set TOKEN_SECRET and RELEASE_ADMIN_TOKEN in a .env file next to this compose file for anything
-# beyond a quick try-out.
+# Everything in containers, for a local try-out: PostgreSQL, the API (which also serves the patients'
+# app), the staff dashboard and the office administration dashboard.
+#
+#   python dev.py docker          (= docker compose up --build)
+#
+#   patients' app       http://localhost:8000/            (API docs: http://localhost:8000/api/docs)
+#   staff dashboard     http://localhost:4300/
+#   office dashboard    http://localhost:4400/
+#   test inbox          http://localhost:8000/api/v1/messages/fake/outbox
+#
+# APP_ENV=dev: the dummy data (dummy-*@example.com / Dummy-<Kind>-pass-123) and the built-in fakes are on.
+# Every secret below is a DUMMY for this local setup — a real deployment sets its own (see README.md).
+
 services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: assistant
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-assistant}
+      POSTGRES_USER: medic
+      POSTGRES_PASSWORD: dummy-postgres-password
       POSTGRES_DB: assistant
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U assistant -d assistant"]
+      test: ["CMD-SHELL", "pg_isready -U medic -d assistant"]
       interval: 5s
       timeout: 3s
       retries: 20
-    restart: unless-stopped
 
-  app:
+  api:
     build:
       context: .
       dockerfile: services/account/Dockerfile
-    image: personal-assistant:latest
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      DATABASE_URL: postgresql+psycopg://medic:dummy-postgres-password@db:5432/assistant
+      TOKEN_SECRET: ${TOKEN_SECRET:-dummy-docker-token-secret-not-for-production}
+      RELEASE_ADMIN_TOKEN: dummy-release-admin-token
+      SEED_FAKE_ACCOUNTS: "true"
+      CORS_ORIGINS: http://localhost:4300,http://127.0.0.1:4300,http://localhost:4400,http://127.0.0.1:4400
+      STAFF_URL: http://localhost:4300/
+      ADMIN_DASHBOARD_URL: http://localhost:4400/
+      WEB_APP_URL: http://localhost:8000/
+      OFFICE_NAME: Medic Office
+      OFFICE_ADDRESS: 1 Example Street, Exampleville (dummy)
+      OFFICE_PHONE: +1 555 010 0000
+      OFFICE_TIMEZONE: ${OFFICE_TIMEZONE:-UTC}
+    ports:
+      - "8000:8000"
+    volumes:
+      - apidata:/app/data
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "${PORT:-8000}:8000"
-    environment:
-      APP_ENV: ${APP_ENV:-dev}
-      DATABASE_URL: postgresql+psycopg://assistant:${POSTGRES_PASSWORD:-assistant}@db:5432/assistant
-      TOKEN_SECRET: ${TOKEN_SECRET:-dev-only-change-me}
-      RELEASE_ADMIN_TOKEN: ${RELEASE_ADMIN_TOKEN:-dev-admin-token}
-      # Name shown in authenticator apps for accounts with two-factor authentication (docs/TWO_FACTOR.md).
-      TWO_FACTOR_ISSUER: ${TWO_FACTOR_ISSUER:-Personal Assistant}
-      # Two-factor codes by e-mail (any SMTP server) and text message (Twilio). Without them the
-      # built-in fake keeps the messages in a test inbox (/api/v1/messages/fake/outbox) — by default
-      # with APP_ENV=dev/test only; in prod the channel is not offered. Empty = that default.
-      MESSAGING_FAKE_PROVIDERS: ${MESSAGING_FAKE_PROVIDERS:-}
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_USERNAME: ${SMTP_USERNAME:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_SECURITY: ${SMTP_SECURITY:-starttls}
-      EMAIL_FROM: ${EMAIL_FROM:-Personal Assistant <no-reply@localhost>}
-      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
-      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
-      TWILIO_FROM: ${TWILIO_FROM:-}
-      TWILIO_MESSAGING_SERVICE_SID: ${TWILIO_MESSAGING_SERVICE_SID:-}
-      SMS_WEBOTP_HOST: ${SMS_WEBOTP_HOST:-}
-      # Sign in with Google / Facebook (docs/OAUTH.md); redirect URI <origin>/api/v1/auth/oauth/<provider>/callback.
-      # Without credentials the built-in fake consent page stands in (APP_ENV=dev/test only).
-      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-      FACEBOOK_APP_ID: ${FACEBOOK_APP_ID:-}
-      FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET:-}
-      APPLE_CLIENT_ID: ${APPLE_CLIENT_ID:-}
-      APPLE_TEAM_ID: ${APPLE_TEAM_ID:-}
-      APPLE_KEY_ID: ${APPLE_KEY_ID:-}
-      APPLE_PRIVATE_KEY: ${APPLE_PRIVATE_KEY:-}
-      OAUTH_FAKE_PROVIDERS: ${OAUTH_FAKE_PROVIDERS:-}
-      PUBLIC_API_URL: ${PUBLIC_API_URL:-}
-      WEB_APP_URL: ${WEB_APP_URL:-}
-      # Payment methods (docs/DEPLOYMENT.md "Payments"): Stripe and PayPal buttons are always
-      # shown; a method works once its credentials + at least one price/plan id are set. Without
-      # them the built-in fakes answer (outside APP_ENV=prod only).
-      BILLING_METHODS: ${BILLING_METHODS:-}
-      BILLING_PROVIDER: ${BILLING_PROVIDER:-stripe}
-      BILLING_FAKE_PROVIDERS: ${BILLING_FAKE_PROVIDERS:-true}
-      # Prices (decimal, in BILLING_CURRENCY) and the flat Lifetime refund; subscriptions
-      # refund the unused days of the period on cancellation.
-      BILLING_CURRENCY: ${BILLING_CURRENCY:-USD}
-      PRICE_PRO_MONTHLY: ${PRICE_PRO_MONTHLY:-1.00}
-      PRICE_PRO_YEARLY: ${PRICE_PRO_YEARLY:-10.00}
-      PRICE_LIFETIME: ${PRICE_LIFETIME:-20.00}
-      REFUND_LIFETIME: ${REFUND_LIFETIME:-10.00}
-      # KPI alert thresholds of the admin payment dashboard (fractions; warn above, alert above 2×).
-      PAYMENT_ALERT_FAILURE_RATE: ${PAYMENT_ALERT_FAILURE_RATE:-0.10}
-      PAYMENT_ALERT_REFUND_RATE: ${PAYMENT_ALERT_REFUND_RATE:-0.25}
-      PAYMENT_ALERT_REVENUE_DROP: ${PAYMENT_ALERT_REVENUE_DROP:-0.30}
-      PAYMENT_ALERT_PAST_DUE: ${PAYMENT_ALERT_PAST_DUE:-5}
-      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
-      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-      PAYPAL_ENV: ${PAYPAL_ENV:-sandbox}
-      PAYPAL_CLIENT_ID: ${PAYPAL_CLIENT_ID:-}
-      PAYPAL_CLIENT_SECRET: ${PAYPAL_CLIENT_SECRET:-}
-      PAYPAL_WEBHOOK_ID: ${PAYPAL_WEBHOOK_ID:-}
-      PAYPAL_PLAN_PRO_MONTHLY: ${PAYPAL_PLAN_PRO_MONTHLY:-}
-      PAYPAL_PLAN_PRO_YEARLY: ${PAYPAL_PLAN_PRO_YEARLY:-}
-      # First administrator(s): register/sign in with one of these e-mails in the app.
-      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
-      # Fake test accounts (free@/pro@/admin@example.com …); ignored when APP_ENV=prod.
-      SEED_FAKE_ACCOUNTS: ${SEED_FAKE_ACCOUNTS:-true}
-      # Sponsored content for free memberships (docs/ADVERTISING.md): kill switch, first-party
-      # image hosts (empty = text only), optional edge country header (empty = never use the IP).
-      ADS_ENABLED: ${ADS_ENABLED:-true}
-      ADS_IMAGE_HOSTS: ${ADS_IMAGE_HOSTS:-}
-      ADS_REGION_HEADER: ${ADS_REGION_HEADER:-}
-      # Ad source (internal|sponsored|affiliate|adsense|microsoft|network) and provider credentials;
-      # see services/account/.env.example. Fakes are off in APP_ENV=prod unless ADS_FAKE_PROVIDERS=true.
-      ADS_SOURCE: ${ADS_SOURCE:-sponsored}
-      ADS_FAKE_PROVIDERS: ${ADS_FAKE_PROVIDERS:-}
-      ADS_AFFILIATE_TAG: ${ADS_AFFILIATE_TAG:-}
-      ADS_ADSENSE_CLIENT: ${ADS_ADSENSE_CLIENT:-}
-      ADS_ADSENSE_SLOT: ${ADS_ADSENSE_SLOT:-}
-      ADS_MICROSOFT_SITE_ID: ${ADS_MICROSOFT_SITE_ID:-}
-      ADS_MICROSOFT_PUBLISHER_ID: ${ADS_MICROSOFT_PUBLISHER_ID:-}
-      ADS_MICROSOFT_AD_UNIT_ID: ${ADS_MICROSOFT_AD_UNIT_ID:-}
-      ADS_NETWORK_NAME: ${ADS_NETWORK_NAME:-}
-      ADS_NETWORK_JSON_URL: ${ADS_NETWORK_JSON_URL:-}
-      ADS_NETWORK_SCRIPT_URL: ${ADS_NETWORK_SCRIPT_URL:-}
-      # The ads admin console runs on its own origin (service below) → allow it and link to it.
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:${ADS_ADMIN_PORT:-8081}}
-      ADS_ADMIN_URL: ${ADS_ADMIN_URL:-http://localhost:${ADS_ADMIN_PORT:-8081}/}
-    restart: unless-stopped
 
-  # Separate advertising console for administrators (apps/ads-admin): static files + nginx,
-  # talks to the API across origins. http://localhost:8081/ — sign in with an administrator account.
-  ads-admin:
-    build:
-      context: ./apps/ads-admin
-      dockerfile: Dockerfile
-    image: personal-assistant-ads-admin:latest
-    ports:
-      - "${ADS_ADMIN_PORT:-8081}:8080"
+  staff:
+    build: apps/staff
     environment:
-      ADS_ADMIN_API_BASE: ${ADS_ADMIN_API_BASE:-http://localhost:${PORT:-8000}}
-    restart: unless-stopped
+      API_BASE: http://localhost:8000
+      SHOW_DUMMY_HINT: "true"
+    ports:
+      - "4300:80"
+    depends_on:
+      - api
+
+  admin:
+    build: apps/admin
+    environment:
+      API_BASE: http://localhost:8000
+      SHOW_DUMMY_HINT: "true"
+    ports:
+      - "4400:80"
+    depends_on:
+      - api
 
 volumes:
   pgdata:
+  apidata:

@@ -70,6 +70,9 @@ STATE_TTL_SECONDS = 600
 TICKET_TTL_SECONDS = 90
 TICKET_TYPE = "oauth"
 FAKE_PATH = "/api/v1/auth/oauth/fake"
+# Credentials of the built-in fake provider: obviously not real, never accepted anywhere else.
+FAKE_CLIENT_ID = "dummy-fake-client"
+FAKE_CLIENT_SECRET = "dummy-fake-secret"
 
 
 class OAuthError(Exception):
@@ -226,7 +229,7 @@ class GoogleProvider(Provider):
         return url if self.fake else url + "&prompt=select_account"
 
     def fetch_profile(self, code, redirect_uri, code_verifier):
-        cid, secret = ("fake-client", "fake-secret") if self.fake else self.credentials()
+        cid, secret = (FAKE_CLIENT_ID, FAKE_CLIENT_SECRET) if self.fake else self.credentials()
         tokens = self._request(
             "POST",
             self.token_url,
@@ -269,7 +272,7 @@ class FacebookProvider(Provider):
         return config.FACEBOOK_APP_ID, config.FACEBOOK_APP_SECRET
 
     def fetch_profile(self, code, redirect_uri, code_verifier):
-        cid, secret = ("fake-client", "fake-secret") if self.fake else self.credentials()
+        cid, secret = (FAKE_CLIENT_ID, FAKE_CLIENT_SECRET) if self.fake else self.credentials()
         tokens = self._request(
             "GET",
             self.token_url
@@ -410,8 +413,8 @@ class AppleProvider(Provider):
         return self._jwks[1]
 
     def fetch_profile(self, code, redirect_uri, code_verifier):
-        cid, _ = ("fake-client", "fake-secret") if self.fake else self.credentials()
-        secret = "fake-secret" if self.fake else apple_client_secret()
+        cid, _ = (FAKE_CLIENT_ID, FAKE_CLIENT_SECRET) if self.fake else self.credentials()
+        secret = FAKE_CLIENT_SECRET if self.fake else apple_client_secret()
         tokens = self._request(
             "POST",
             self.token_url,
@@ -489,7 +492,7 @@ class _FakeTransport:
             if self.p.name == APPLE:  # Apple: the profile travels in a (here unsigned) id_token
                 claims = {
                     "iss": "https://appleid.apple.com",
-                    "aud": "fake-client",
+                    "aud": FAKE_CLIENT_ID,
                     "sub": profile["sub"],
                     "email": profile["email"],
                     "email_verified": "true",
@@ -644,8 +647,16 @@ def _with_fragment(url: str, **params: str) -> str:
 # ---------------------------------------------------------------------------- the flow
 
 
-def start_url(request: Request, name: str, return_to: str | None, *, link_account: models.Account | None = None) -> str:
-    """The provider's authorization URL for a sign-in (or for linking ``link_account``)."""
+def start_url(
+    request: Request,
+    name: str,
+    return_to: str | None,
+    *,
+    link_account: models.Account | None = None,
+    audience: str = "office",
+) -> str:
+    """The provider's authorization URL for a sign-in (or for linking ``link_account``). The
+    ``audience`` travels in the sealed state: the patients' app creates patient accounts only."""
     p = provider(name)
     if not p.available:
         raise HTTPException(status_code=503, detail=f"Sign in with {p.label} is not set up on this server.")
@@ -659,6 +670,7 @@ def start_url(request: Request, name: str, return_to: str | None, *, link_accoun
             "v": verifier,
             "r": safe_return_to(return_to, request),
             "link": link_account.id if link_account else None,
+            "a": audience,
         }
     )
     return p.authorization_url(base, redirect_uri(base, name), state, challenge)
@@ -688,7 +700,7 @@ def handle_callback(db: Session, request: Request, name: str, params: dict[str, 
         profile = p.fetch_profile(code, redirect_uri(api_base(request), name), state.get("v", ""))
         if state.get("link"):
             return _with_fragment(return_to, oauth_linked=link_identity(db, p, profile, state["link"]).provider)
-        account = account_for(db, p, profile)
+        account = account_for(db, p, profile, audience=state.get("a") or "office")
     except OAuthError as exc:
         return _with_fragment(return_to, oauth_error=str(exc))
     db.commit()
@@ -703,9 +715,16 @@ def _identity(db: Session, p: Provider, subject: str) -> models.OAuthIdentity | 
     ).scalar_one_or_none()
 
 
-def account_for(db: Session, p: Provider, profile: Profile) -> models.Account:
+def _check_audience(account: models.Account, audience: str) -> None:
+    try:
+        auth.check_audience(account, audience)
+    except HTTPException as exc:
+        raise OAuthError(str(exc.detail)) from None
+
+
+def account_for(db: Session, p: Provider, profile: Profile, audience: str = "office") -> models.Account:
     """The account this provider identity signs in to: linked before, linked now by verified
-    e-mail, or created. Caller commits."""
+    e-mail, or created (as a patient account when the patients' app asked). Caller commits."""
     identity = _identity(db, p, profile.subject)
     if identity is not None:
         account = db.get(models.Account, identity.account_id)
@@ -713,6 +732,7 @@ def account_for(db: Session, p: Provider, profile: Profile) -> models.Account:
             raise OAuthError("This account was deleted. Create a new one to continue.")
         identity.last_login_at = models.utcnow()
         auth.apply_bootstrap_role(account)
+        _check_audience(account, audience)
         return account
     if not profile.email:
         raise OAuthError(
@@ -727,11 +747,17 @@ def account_for(db: Session, p: Provider, profile: Profile) -> models.Account:
                 f"An account with this e-mail exists, but {p.label} has not verified the address. Sign in with your "
                 f"password, then link {p.label} from the account screen."
             )
+        _check_audience(account, audience)
         how = "verified_email"
     else:
         salt = auth.new_salt()
         account = models.Account(
-            email=profile.email, auth_salt=salt, auth_hash="", wrapped_data_key="", kdf_params="{}"
+            email=profile.email,
+            auth_salt=salt,
+            auth_hash="",
+            wrapped_data_key="",
+            kdf_params="{}",
+            role=models.ROLE_PATIENT if audience == "patient" else models.ROLE_USER,
         )
         auth.apply_bootstrap_role(account)
         db.add(account)

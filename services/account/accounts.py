@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 import models
@@ -34,6 +34,10 @@ def purge(db: Session, account: models.Account) -> None:
     account.otp_email = None
     db.execute(delete(models.OneTimeCode).where(models.OneTimeCode.account_id == account.id))
     db.execute(delete(models.OAuthIdentity).where(models.OAuthIdentity.account_id == account.id))
+    # A patient's payment methods on file (patient_payment_methods.py) go with the account.
+    db.execute(delete(models.PatientPaymentMethod).where(models.PatientPaymentMethod.account_id == account.id))
+    # A staff account: the worker record stays (the roster), it is just no longer linked.
+    db.execute(update(models.Worker).where(models.Worker.account_id == account.id).values(account_id=None))
 
 
 def revoke_all_devices(db: Session, account: models.Account) -> int:

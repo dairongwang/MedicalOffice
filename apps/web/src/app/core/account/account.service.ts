@@ -233,7 +233,7 @@ export interface DeviceOut {
 export interface Me {
   account_id: string;
   email: string;
-  role: 'user' | 'admin';
+  role: 'user' | 'admin' | 'patient';
   created_at: string;
   vault_enabled: boolean;
   devices: DeviceOut[];
@@ -370,6 +370,10 @@ export class AccountService {
     };
   }
 
+  /** This app is the patients' app: it creates and signs in *patient* accounts only
+   *  (the server refuses staff / administrator accounts here, and patients on the dashboards). */
+  static readonly AUDIENCE = 'patient';
+
   async register(email: string, password: string): Promise<void> {
     this.busy.set(true);
     try {
@@ -384,6 +388,7 @@ export class AccountService {
           wrapped_data_key: wrapped,
           kdf_params: KDF_PARAMS,
           device: this.deviceInfo(),
+          audience: AccountService.AUDIENCE,
         },
         { auth: false },
       );
@@ -405,7 +410,12 @@ export class AccountService {
       const keys = await deriveKeys(password, email); // default params; re-derive if the account pins others
       const res = await this.api.post<Session | TwoFactorChallenge>(
         '/auth/login',
-        { email, auth_key: keys.authKey, device: this.deviceInfo() },
+        {
+          email,
+          auth_key: keys.authKey,
+          device: this.deviceInfo(),
+          audience: AccountService.AUDIENCE,
+        },
         { auth: false },
       );
       if ('challenge' in res) {
@@ -431,7 +441,12 @@ export class AccountService {
     try {
       const session = await this.api.post<Session>(
         '/auth/login/2fa',
-        { challenge: challenge.challenge, code: code.trim(), device: this.deviceInfo() },
+        {
+          challenge: challenge.challenge,
+          code: code.trim(),
+          device: this.deviceInfo(),
+          audience: AccountService.AUDIENCE,
+        },
         { auth: false },
       );
       this.twoFactorPending.set(null);
@@ -495,7 +510,7 @@ export class AccountService {
 
   /** Where to send the browser to sign in with a provider; it comes back to this page. */
   oauthStartUrl(provider: OAuthProviderName): string {
-    return `${this.api.base}/auth/oauth/${provider}/start?return_to=${encodeURIComponent(this.returnTo())}`;
+    return `${this.api.base}/auth/oauth/${provider}/start?return_to=${encodeURIComponent(this.returnTo())}&audience=${AccountService.AUDIENCE}`;
   }
 
   private returnTo(): string {
@@ -530,7 +545,7 @@ export class AccountService {
       this.oauthProvider.set(provider || null);
       const res = await this.api.post<Session | TwoFactorChallenge>(
         '/auth/oauth/complete',
-        { ticket, device: this.deviceInfo() },
+        { ticket, device: this.deviceInfo(), audience: AccountService.AUDIENCE },
         { auth: false },
       );
       if ('challenge' in res) {

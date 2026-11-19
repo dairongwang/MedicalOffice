@@ -4,16 +4,24 @@
 Standard library only; always runs tools from the project's own environments
 (services/account/venv for Python, apps/web/node_modules for the Angular PWA).
 
-    python dev.py setup            create the venv, install Python + npm dependencies
+    python dev.py setup            create the venv, install Python + npm dependencies, migrate the database
+                                   to the current schema (--no-db to skip; `db upgrade` does it any time)
     python dev.py db [cmd]         local PostgreSQL: init [--port N] | start | stop | status | upgrade | revision "msg"
                                    (init picks a free port by itself when 5432 belongs to another server)
-    python dev.py run              API (auto-reload) + Angular dev server with /api proxy + the ads admin
-                                   console on http://localhost:4300/ (uses the local PostgreSQL if it is
-                                   running, otherwise SQLite; creates the fake test accounts and dummy
-                                   campaigns — SEED_FAKE_ACCOUNTS=false to skip)
-    python dev.py seed             (re)create the fake test accounts: free@ / trial@ / pro@ / lifetime@ /
-                                   pastdue@ / expired@ / admin@ / twofa@example.com  (services/account/seed.py)
-                                   and the dummy sponsored-content campaigns (docs/ADVERTISING.md)
+    python dev.py run              API (auto-reload) + main app (Angular dev server, /api proxy) + the staff
+                                   dashboard (apps/staff) on http://localhost:4300/ + the office administration
+                                   dashboard (apps/admin) on http://localhost:4400/ (uses the local PostgreSQL
+                                   if it is running, otherwise SQLite; creates the dummy accounts, staff,
+                                   applications, patients and campaigns — SEED_FAKE_ACCOUNTS=false to skip)
+    python dev.py seed             (re)create the dummy test accounts dummy-free@ / dummy-trial@ / dummy-pro@ /
+                                   dummy-lifetime@ / dummy-pastdue@ / dummy-expired@ / dummy-admin@ /
+                                   dummy-twofa@ / dummy-patient@ / dummy-doctor@ / dummy-nurse@ /
+                                   dummy-assistant@ / dummy-assistant2@example.com (medical assistants)
+                                   (services/account/seed.py), the dummy staff, applications, patients,
+                                   a past visit with the visit summary the doctor signed, medical-assistant
+                                   tasks, immunizations, a signed immunization record and an open request for
+                                   an annual health examination report, Pat's daughter Sky on the patient
+                                   account (My medicines: a tab each), and sponsored-content campaigns
     python dev.py seed --ads       only the dummy campaigns (add --force when APP_ENV=prod)
     python dev.py promote <email>  give an existing account the administrator role (demote: --demote)
     python dev.py outbox [N]       show the e-mails / text messages the built-in fake "sent" (two-factor
@@ -24,9 +32,14 @@ Standard library only; always runs tools from the project's own environments
     python dev.py build            production build of the PWA (apps/web/dist)
     python dev.py test             Python unit tests (SQLite) + Angular unit tests + ads-admin node tests
     python dev.py test --postgres  same, with the API tests against TEST_DATABASE_URL / local db
-    python dev.py e2e              end-to-end tests in a real browser (updates, sync, privacy) — uses any
-                                   browser found: bundled Chromium, Edge, Chrome, Firefox, WebKit
-                                   (E2E_BROWSER=msedge|chrome|chromium|firefox|webkit to pick one)
+    python dev.py e2e              end-to-end tests in a real browser (e2e/tests/test_*.py). The session starts an
+                                   isolated stack on free ports (API with a throw-away database and the dummy data,
+                                   staff + office administration dashboards); the tests cover the medical-assistant
+                                   workflow (assign by availability, take, complete every duty, report, reassign),
+                                   the role-specific tabs and the locked office dashboard. Browser: Playwright's
+                                   Chromium (python -m playwright install chromium), or E2E_BROWSER_PATH=<chrome
+                                   binary>, or `cd e2e && npm install` (Chromium inside an npm package, for
+                                   machines that cannot reach Playwright's download server)
     python dev.py lint             ruff + prettier/tsc checks
     python dev.py format           auto-format Python and TypeScript
     python dev.py check            lint + test (what CI runs)
@@ -49,7 +62,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "apps" / "web"
-ADS_ADMIN = ROOT / "apps" / "ads-admin"  # separate advertising console (static, no build)
+STAFF = ROOT / "apps" / "staff"  # staff dashboard: separate static app (no build step), own port/container
+ADMIN = ROOT / "apps" / "admin"  # office administration dashboard: same arrangement (patients, appointments)
+ADS_ADMIN = ROOT / "apps" / "ads-admin"  # optional advertising console (not part of every checkout)
 SERVICE = ROOT / "services" / "account"
 VENV = SERVICE / "venv"
 E2E = ROOT / "e2e"
@@ -398,7 +413,7 @@ def cmd_setup(args: list[str]) -> int:
     e2e_reqs = E2E / "requirements.txt"
     if e2e_reqs.is_file():
         run([py, "-m", "pip", "install", "-r", str(e2e_reqs)], check=True)
-    else:
+    elif E2E.is_dir():
         print(f"note: {e2e_reqs} is missing — installing the end-to-end test tools directly.")
         run([py, "-m", "pip", "install", *E2E_TOOLS], check=True)
     check_node()
@@ -412,6 +427,17 @@ def cmd_setup(args: list[str]) -> int:
         cwd=WEB,
         check=True,
     )
+    if not ENV_FILE.is_file() and (SERVICE / ".env.example").is_file():
+        shutil.copy(SERVICE / ".env.example", ENV_FILE)  # dummy local values; see the comments inside
+        print(f"created {ENV_FILE} from .env.example (dummy development values)")
+    # Bring the database to the current schema (Alembic, services/account/alembic/versions): the
+    # SQLite file is created/upgraded here, an existing PostgreSQL (DATABASE_URL / local cluster)
+    # is upgraded in place. The API does the same at every start (SQLite always, PostgreSQL with
+    # AUTO_MIGRATE=true or the container's `alembic upgrade head`), so a checkout with new
+    # migrations never runs against an old schema.
+    if "--no-db" not in args:
+        print("\nDatabase schema (Alembic migrations):")
+        run([py, "database.py"], env={"DATABASE_URL": database_url()})
     print("\nSetup complete.  Next:  python dev.py run          (SQLite, no database server needed)")
     print("                   or:  python dev.py db init && python dev.py run   (local PostgreSQL)")
     return 0
@@ -523,6 +549,24 @@ def cmd_db(args: list[str]) -> int:
             "(set)" if os.environ.get("DATABASE_URL") else "(not set — dev.py picks PostgreSQL if running, else SQLite)"
         )
         print(f"DATABASE_URL:      {configured}")
+        # The schema revision of the database actually used: the PostgreSQL that answers, or the
+        # SQLite file `run` falls back to (quietly — no fallback note here).
+        sqlite_path = SERVICE / "data" / "account.db"
+        schema_url = (
+            target
+            if status == "ok" or not target.startswith("postgresql")
+            else f"sqlite:///{sqlite_path.as_posix()}"
+            if sqlite_path.is_file()
+            else None
+        )
+        if schema_url and venv_python().exists():
+            fallback = schema_url.startswith("sqlite") and target.startswith("postgresql")
+            print(f"Schema:            {'(SQLite fallback) ' if fallback else ''}", end="", flush=True)
+            subprocess.call(
+                [str(venv_python()), "-c", "import database; print(database.schema_status())"],
+                cwd=str(SERVICE),
+                env={**os.environ, "DATABASE_URL": schema_url, "PYTHONUTF8": "1"},
+            )
         return 0
     print("Subcommands: init | start | stop | status | upgrade | revision <msg>")
     return 1
@@ -552,7 +596,7 @@ def prepare_environment() -> None:
             f"note: APP_ENV={env}: /api/docs needs an administrator account"
             + (" and the fake test accounts are not created." if env == "prod" else "."),
             "      First administrator: put your e-mail in ADMIN_EMAILS (services/account/.env) before registering,",
-            "      or register in the app and run:  python dev.py promote you@example.com",
+            "      or register in the app and run:  python dev.py promote dummy-you@example.com",
         ]
         if env == "prod":
             hints += [
@@ -584,8 +628,13 @@ def cmd_run(_args: list[str]) -> int:
     require_node_modules()
     check_node()
     api_port, web_port = os.environ.get("PORT", "8000"), os.environ.get("WEB_PORT", "4200")
-    admin_port = os.environ.get("ADS_ADMIN_PORT", "4300")
-    for port in (api_port, web_port, admin_port):
+    admin_port = os.environ.get("ADS_ADMIN_PORT", "4310")
+    staff_port = os.environ.get("STAFF_PORT", "4300")
+    office_admin_port = os.environ.get("ADMIN_PORT", "4400")
+    ports = [api_port, web_port, staff_port, office_admin_port] + (
+        [admin_port] if (ADS_ADMIN / "serve.py").is_file() else []
+    )
+    for port in ports:
         if port_in_use(port):
             pids = listeners(port)
             sys.exit(
@@ -601,15 +650,42 @@ def cmd_run(_args: list[str]) -> int:
             # The ads admin console is a separate origin in development (its own port) → CORS,
             # and the user app's admin dialog links to it.
             "CORS_ORIGINS": os.environ.get(
-                "CORS_ORIGINS", f"http://localhost:{admin_port},http://127.0.0.1:{admin_port}"
+                "CORS_ORIGINS",
+                ",".join(
+                    f"http://localhost:{p},http://127.0.0.1:{p}" for p in (staff_port, office_admin_port, admin_port)
+                ),
             ),
+            "STAFF_URL": os.environ.get("STAFF_URL", f"http://localhost:{staff_port}/"),
+            "ADMIN_DASHBOARD_URL": os.environ.get("ADMIN_DASHBOARD_URL", f"http://localhost:{office_admin_port}/"),
             "ADS_ADMIN_URL": os.environ.get("ADS_ADMIN_URL", f"http://localhost:{admin_port}/"),
         },
     )
+    # Staff dashboard: plain static files (no build step) on its own origin, pointed at the API.
+    staff = popen_tree(
+        [sys.executable, str(STAFF / "serve.py"), "--port", staff_port, "--api", f"http://localhost:{api_port}"],
+        STAFF,
+    )
+    # Office administration dashboard (patients, appointments): same arrangement as the staff dashboard.
+    office_admin = popen_tree(
+        [sys.executable, str(ADMIN / "serve.py"), "--port", office_admin_port, "--api", f"http://localhost:{api_port}"],
+        ADMIN,
+    )
     # Ads admin console: plain static files (no build step) on its own origin, pointed at the API.
-    ads_admin = popen_tree(
-        [sys.executable, str(ADS_ADMIN / "serve.py"), "--port", admin_port, "--api", f"http://localhost:{api_port}"],
-        ADS_ADMIN,
+    # Optional — this checkout may not contain apps/ads-admin.
+    ads_admin = (
+        popen_tree(
+            [
+                sys.executable,
+                str(ADS_ADMIN / "serve.py"),
+                "--port",
+                admin_port,
+                "--api",
+                f"http://localhost:{api_port}",
+            ],
+            ADS_ADMIN,
+        )
+        if (ADS_ADMIN / "serve.py").is_file()
+        else None
     )
     # NG_CLI_ANALYTICS=false: on first use the Angular CLI otherwise stops at an interactive
     # "share usage data?" question. --host 127.0.0.1 keeps the address unambiguous (IPv4 vs IPv6).
@@ -632,6 +708,14 @@ def cmd_run(_args: list[str]) -> int:
             if api.poll() is not None:
                 print(f"\nThe API exited with code {api.returncode} — see the messages above.", file=sys.stderr)
                 return api.returncode or 1
+            if staff.poll() is not None:
+                print(f"\nThe staff dashboard server exited with code {staff.returncode}.", file=sys.stderr)
+                return staff.returncode or 1
+            if office_admin.poll() is not None:
+                print(
+                    f"\nThe office administration server exited with code {office_admin.returncode}.", file=sys.stderr
+                )
+                return office_admin.returncode or 1
             if not announced:
                 ready["API"] = ready["API"] or port_in_use(api_port)
                 ready["app"] = ready["app"] or http_ok(f"http://127.0.0.1:{web_port}/")
@@ -639,10 +723,30 @@ def cmd_run(_args: list[str]) -> int:
                     announced = True
                     print(f"\n  API:  http://localhost:{api_port}/api/docs")
                     print(f"  App:  http://localhost:{web_port}/   (or http://127.0.0.1:{web_port}/)")
+                    print("        Patients: /patients (registration) · /patients/appointments (book a visit)")
+                    print("                  /patients/mine (dashboard) · /patients/payments (methods + history)")
+                    print("                  patient account: dummy-patient@example.com / Dummy-Patient-pass-123")
+                    print(f"  Staff dashboard:  http://localhost:{staff_port}/   (apply · availability · staff:")
+                    print("                    My appointments — dummy-doctor@example.com / Dummy-Doctor-pass-123")
+                    print("                    medical assistants: My tasks — dummy-assistant@example.com /")
+                    print("                    Dummy-Assistant-pass-123 · or Create staff account ·")
+                    print("                    managers: applications · onboarding · roster)")
+                    print(f"  Office admin:     http://localhost:{office_admin_port}/   (patients · appointments ·")
+                    print("                    assign medical assistants · payments: the office-wide payment history)")
+                    print("                    managers/administrators: dummy-admin@example.com / Dummy-Admin-pass-123")
                     print("        (Angular dev server — no service worker; use `python dev.py serve` to test updates)")
-                    print(
-                        f"  Ads admin console:  http://localhost:{admin_port}/   (admin@example.com / Admin-pass-123)"
-                    )
+                    if ads_admin is not None:
+                        admin_url = f"http://localhost:{admin_port}/"
+                        print(f"  Ads admin console:  {admin_url}   (dummy-admin@example.com / Dummy-Admin-pass-123)")
+                    print("  Visit summaries: the doctor signs them on the patient's chart (staff dashboard → My")
+                    print("                   appointments → Open chart → Visit summary); the patient reads them in")
+                    print("                   My appointments → Past → Visit summary (dummy-patient@example.com)")
+                    print("  Reports: patients ask in My reports; the office prepares them (Reports tab); the doctor")
+                    print("           signs them on the staff dashboard → Reports (immunization record, annual exam)")
+                    print("  My medicines: patients' app → Patients → My medicines (/patients/medicines) — a tab")
+                    print("                per patient (Pat, Sky): the medicines, dosing and the doctor's instructions")
+                    print('  Test inbox (e-mails / texts the fakes "sent"):')
+                    print(f"                   http://localhost:{api_port}/api/v1/messages/fake/outbox")
                     print("  Stop: Ctrl+C\n", flush=True)
                 elif time.time() - started > 180:
                     announced = True
@@ -658,7 +762,10 @@ def cmd_run(_args: list[str]) -> int:
         return 0
     finally:
         kill_tree(web)
-        kill_tree(ads_admin)
+        kill_tree(staff)
+        kill_tree(office_admin)
+        if ads_admin is not None:
+            kill_tree(ads_admin)
         kill_tree(api)
 
 
@@ -693,7 +800,9 @@ def cmd_stop(_args: list[str]) -> int:
     for port in (
         os.environ.get("PORT", "8000"),
         os.environ.get("WEB_PORT", "4200"),
-        os.environ.get("ADS_ADMIN_PORT", "4300"),
+        os.environ.get("STAFF_PORT", "4300"),
+        os.environ.get("ADMIN_PORT", "4400"),
+        os.environ.get("ADS_ADMIN_PORT", "4310"),
     ):
         for pid in listeners(port):
             found = True
@@ -721,12 +830,15 @@ def cmd_stop(_args: list[str]) -> int:
 def cmd_outbox(args: list[str]) -> int:
     """Print what the built-in e-mail/SMS fake "sent" (two-factor codes) — newest last.
     Reads DATA_DIR/message_outbox.json directly: works on every OS, with or without the API
-    running. `--clear` empties it; a number limits how many are shown (default 10)."""
+    running. Attachments (e.g. a prescription PDF e-mailed to a pharmacy) are listed with the file
+    they were saved to. `--clear` empties it; a number limits how many are shown (default 10)."""
     data_dir = Path(os.environ.get("DATA_DIR") or SERVICE / "data")
     path = data_dir / "message_outbox.json"
+    files = data_dir / "message_outbox_files"
     if "--clear" in args:
         if path.is_file():
             path.write_text("[]", encoding="utf-8")
+        shutil.rmtree(files, ignore_errors=True)
         print("Test inbox cleared.")
         return 0
     # Piped/redirected output on Windows may be cp1252: never crash on "—" or "•".
@@ -747,6 +859,9 @@ def cmd_outbox(args: list[str]) -> int:
             + (f" · {m['subject']}" if m.get("subject") else "")
         )
         print("  " + "\n  ".join(str(m.get("body", "")).splitlines()))
+        for a in m.get("attachments") or []:
+            saved = files / str(m.get("id", "")) / str(a.get("filename"))
+            print(f"  📎 {a.get('filename')} ({a.get('size', '?')} bytes) — {saved}")
     print(f"\n({len(messages)} message(s) in {path}; also at http://localhost:8000/api/v1/messages/fake/outbox)")
     return 0
 
@@ -781,9 +896,22 @@ def cmd_serve(_args: list[str]) -> int:
         "0.0.0.0",
         port,
         reload=False,
-        extra_env={"WEB_DIST": str(WEB / "dist" / "web" / "browser"), "ADS_ADMIN_DIST": str(ADS_ADMIN)},
+        extra_env={
+            "WEB_DIST": str(WEB / "dist" / "web" / "browser"),
+            "STAFF_DIST": str(STAFF),
+            "ADMIN_DASHBOARD_DIST": str(ADMIN),
+            # The appointment links in e-mails / texts point at this process (unless configured).
+            "WEB_APP_URL": os.environ.get("WEB_APP_URL", f"http://localhost:{port}/"),
+            **({"ADS_ADMIN_DIST": str(ADS_ADMIN)} if ADS_ADMIN.is_dir() else {}),
+        },
     )
-    print(f"  Ads admin:      http://localhost:{port}/ads-admin/\n")
+    print(f"  Patients:       http://localhost:{port}/patients   (appointments: /patients/appointments ·")
+    print("                  dashboard: /patients/mine · payments: /patients/payments · dummy-patient@example.com)")
+    print(f"  Staff:          http://localhost:{port}/staff/")
+    print(f"  Office admin:   http://localhost:{port}/admin/   (patients · appointments · payments)")
+    if ADS_ADMIN.is_dir():
+        print(f"  Ads admin:      http://localhost:{port}/ads-admin/")
+    print()
     try:
         return api.wait()
     except KeyboardInterrupt:
@@ -801,25 +929,35 @@ def cmd_test(args: list[str]) -> int:
     if (WEB / "node_modules").is_dir():
         code = code or run([npm(), "test", "--", "--watch=false"], cwd=WEB)
     node = shutil.which("node")
-    if node:  # ads admin console helpers (no dependencies)
-        code = code or run(
-            [node, "--test", *sorted(str(p) for p in (ADS_ADMIN / "tests").glob("*.test.mjs"))], cwd=ROOT
-        )
+    node_tests = sorted(
+        str(p) for d in (STAFF, ADMIN, ADS_ADMIN) if d.is_dir() for p in (d / "tests").glob("*.test.mjs")
+    )
+    if node and node_tests:  # staff / office admin dashboards / ads console logic (no dependencies)
+        code = code or run([node, "--test", *node_tests], cwd=ROOT)
     return code
 
 
 def cmd_e2e(args: list[str]) -> int:
     py = require_venv()
     require_node_modules()
+    if not E2E.is_dir():
+        sys.exit("The end-to-end suite (e2e/) is not part of this checkout.")
     return run([py, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=E2E)
+
+
+def _extra_python_paths() -> list[str]:
+    """Python outside services/account that ruff should check — only what exists in this checkout."""
+    return [
+        str(p)
+        for p in (E2E, ROOT / "dev.py", STAFF / "serve.py", ADMIN / "serve.py", ADS_ADMIN / "serve.py")
+        if p.exists()
+    ]
 
 
 def cmd_lint(_args: list[str]) -> int:
     py = require_venv()
     code = run([py, "-m", "ruff", "check", "."]) or run([py, "-m", "ruff", "format", "--check", "."])
-    code = code or run(
-        [py, "-m", "ruff", "check", str(E2E), str(ROOT / "dev.py"), str(ADS_ADMIN / "serve.py")], cwd=ROOT
-    )
+    code = code or run([py, "-m", "ruff", "check", *_extra_python_paths()], cwd=ROOT)
     if (WEB / "node_modules").is_dir():
         code = code or run([npm(), "run", "lint"], cwd=WEB)
     return code
@@ -828,9 +966,7 @@ def cmd_lint(_args: list[str]) -> int:
 def cmd_format(_args: list[str]) -> int:
     py = require_venv()
     code = run([py, "-m", "ruff", "check", "--fix", "."]) or run([py, "-m", "ruff", "format", "."])
-    code = code or run(
-        [py, "-m", "ruff", "format", str(E2E), str(ROOT / "dev.py"), str(ADS_ADMIN / "serve.py")], cwd=ROOT
-    )
+    code = code or run([py, "-m", "ruff", "format", *_extra_python_paths()], cwd=ROOT)
     if (WEB / "node_modules").is_dir():
         code = code or run([npm(), "run", "format"], cwd=WEB)
     return code

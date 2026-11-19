@@ -6,5 +6,5 @@ export const RELEASE = {
   "minSupportedSchema": 2,
   "critical": false,
   "channel": "stable",
-  "notes": "First release of the local-first PWA: tasks and events live on your device, optional end-to-end-encrypted sync, automatic updates."
+  "notes": "Patients tab: registration and appointment scheduling (book, see and cancel visits with a doctor or nurse). Optional account with end-to-end-encrypted sync, automatic updates."
 } as const;

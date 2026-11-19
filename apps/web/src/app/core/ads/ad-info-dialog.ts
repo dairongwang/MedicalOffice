@@ -1,178 +1,161 @@
-import { Component, computed, inject, output, viewChild } from '@angular/core';
+import { Component, computed, inject, output, signal, viewChild } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MembershipService } from '../membership/membership.service';
 import type { AdRegionMode } from '../settings/settings.service';
 import { DialogDirective } from '../ui/dialog.directive';
 import { TipDirective } from '../ui/tip.directive';
+import { ToastService } from '../ui/toast.service';
 import { AdsService } from './ads.service';
-import { countryName, countryOptions } from './region';
+import { isValidRegion } from './region';
 
 /**
- * "Why am I seeing this?" — the transparency and control screen for sponsored content.
- * Plain language, the actual values in use on this device, and the switches (GDPR Art. 13/21,
- * CCPA notice-at-collection): turn it off, choose the region, or go Pro.
+ * "Why this?" — what the sponsored-content panel does and the controls for it: on/off,
+ * region (auto / chosen / none), panel size, third-party consent, and the ad-free upgrade.
  */
 @Component({
   selector: 'app-ad-info-dialog',
   imports: [FormsModule, DialogDirective, TipDirective],
   template: `
     <dialog appDialog id="ad-info-dialog" aria-labelledby="ad-info-title">
-      <form (ngSubmit)="dialog().close()">
-        <h3 id="ad-info-title">About sponsored content</h3>
-        <p class="muted small">
-          The free version shows one small, clearly labelled sponsored message. It is picked by
-          context only — your country and language as known to this device — never by who you are or
-          what you write. There is no ad network, no cookie and no tracker involved.
+      <form (ngSubmit)="close()">
+        <h3 id="ad-info-title">Sponsored content</h3>
+
+        <p class="small muted">
+          Free memberships help pay for the app by showing a small sponsored card. It is chosen
+          <strong>contextually</strong> — from a coarse region and your language, both decided on
+          this device — never from who you are or what you keep in the app. Your tasks and events
+          never leave your device unencrypted.
         </p>
 
-        <div class="update-summary" id="ad-info-facts">
-          <div id="ad-info-source">
-            <span class="muted">Source</span>
-            <strong
-              >{{ ads.source()?.title ?? 'not loaded yet'
-              }}{{ ads.source()?.mode === 'fake' ? ' (fake)' : '' }}</strong
-            >
-            <span class="small">
-              @if (ads.source()?.third_party) {
-                Third party: {{ ads.source()?.provider_name }} —
-                {{
-                  ads.consentState() === 'granted'
-                    ? 'allowed on this device'
-                    : ads.consentState() === 'denied'
-                      ? 'declined on this device'
-                      : 'not loaded until you allow it'
-                }}.
-                @if (ads.consentState()) {
-                  <button
-                    type="button"
-                    class="link"
-                    id="ad-info-withdraw"
-                    (click)="withdraw()"
-                    appTip="Forget your decision for this provider; the panel asks again and loads nothing until then."
-                  >
-                    Withdraw
-                  </button>
-                }
-              } @else if (ads.source()?.kind === 'network') {
-                Served to this server by {{ ads.source()?.provider_name }}; your browser never
-                contacts the network.
-              } @else {
-                First-party: chosen and delivered by this app's own server.
-              }
-            </span>
+        @if (ads.source(); as src) {
+          <div class="update-summary" id="ad-info-source">
+            <div>
+              <span class="muted small">Source</span>
+              <span>{{ src.title }}{{ src.mode === 'fake' ? ' (built-in fake)' : '' }}</span>
+            </div>
+            <div>
+              <span class="muted small">Region used</span>
+              <span>{{ regionText() }}</span>
+            </div>
+            <div>
+              <span class="muted small">Collected</span>
+              <span>{{
+                src.third_party
+                  ? 'Whatever the provider collects once allowed (see its policy)'
+                  : 'Anonymous daily view/click totals per region — no identifiers'
+              }}</span>
+            </div>
+            <div>
+              <span class="muted small">Third party</span>
+              <span>{{ src.third_party ? src.provider_name || 'yes' : 'none' }}</span>
+            </div>
           </div>
-          <div>
-            <span class="muted">Used to pick it</span>
-            <strong id="ad-info-region">Region: {{ regionLabel() }}</strong>
-            <span class="small"
-              >Language: {{ ads.language() ?? 'unknown' }} · Membership:
-              {{ membership.label() }}</span
-            >
-          </div>
-          <div>
-            <span class="muted">Never used</span>
-            <strong>Your tasks, events and notes</strong>
-            <span class="small"
-              >Nor your account or e-mail, a precise location, browsing history, cookies or
-              third-party trackers. The request is sent without your sign-in.</span
-            >
-          </div>
-          <div>
-            <span class="muted">What is counted</span>
-            <strong>Views and clicks — per message, per day, per country</strong>
-            <span class="small">Anonymous totals; nothing that identifies you or this device.</span>
-          </div>
-          <div>
-            <span class="muted">Shared with sponsors</span>
-            <strong>Nothing</strong>
-            <span class="small"
-              >Links open in a new tab without a referrer; sponsors only see their own totals.</span
-            >
-          </div>
-        </div>
-
-        @if (ads.privacySignal) {
-          <div class="callout small" id="ad-info-gpc">
-            <p>
-              Your browser sends a Global Privacy Control / Do Not Track signal, so no region is
-              detected automatically. You can still choose one below.
-            </p>
+          @if (src.disclosure) {
+            <p class="small muted">{{ src.disclosure }}</p>
+          }
+        } @else if (ads.error()) {
+          <div class="callout error">
+            <strong>Could not load the sponsored content.</strong><span>{{ ads.error() }}</span>
           </div>
         }
 
-        <label class="checkbox" for="ad-enabled">
+        <label
+          class="checkbox"
+          for="ad-enabled"
+          appTip="Off: the panel disappears and this device never asks for sponsored content."
+        >
           <input
             type="checkbox"
             id="ad-enabled"
             [checked]="ads.enabled()"
-            (change)="ads.setEnabled($any($event.target).checked)"
-            appTip="Off: the sponsored panel disappears on this device and nothing is requested. You can turn it back on here at any time."
+            (change)="toggleEnabled($any($event.target).checked)"
           />
           <span>Show sponsored content on this device</span>
         </label>
 
         <div class="field">
-          <label for="ad-region-mode">Pick offers for</label>
+          <label for="ad-region-mode">Region</label>
           <select
             class="input"
             id="ad-region-mode"
-            name="mode"
-            [ngModel]="ads.regionMode()"
+            name="regionMode"
+            [ngModel]="mode()"
             (ngModelChange)="setMode($event)"
-            [disabled]="!ads.enabled()"
-            appTip="Which country the offers are for. Automatic uses the time zone and language of this device; nothing is looked up elsewhere. 'No region' shows worldwide offers only."
+            appTip="Auto: derived from your language and time zone on this device. Choose: a country you pick. None: no region is sent."
           >
-            <option value="auto">Detected on this device: {{ detectedLabel() }}</option>
-            <option value="manual">A country I choose</option>
-            <option value="off">No region — worldwide offers only</option>
+            <option value="auto">Automatic (from language / time zone)</option>
+            <option value="manual">Choose a country</option>
+            <option value="off">Do not send a region</option>
           </select>
         </div>
-        @if (ads.regionMode() === 'manual') {
+        @if (mode() === 'manual') {
           <div class="field">
-            <label for="ad-region">Country</label>
-            <select
+            <label for="ad-region">Country code (two letters, e.g. US, DE)</label>
+            <input
               class="input"
               id="ad-region"
               name="region"
-              [ngModel]="ads.manualRegion() ?? ''"
-              (ngModelChange)="ads.setRegionMode('manual', $event || null)"
-              [disabled]="!ads.enabled()"
-              appTip="Offers are picked for this country. Saved on this device only."
-            >
-              <option value="">Choose a country…</option>
-              @for (c of countries; track c.code) {
-                <option [value]="c.code">{{ c.name }}</option>
-              }
-            </select>
+              maxlength="2"
+              autocomplete="off"
+              [ngModel]="regionInput()"
+              (ngModelChange)="regionInput.set($event)"
+              (blur)="applyRegion()"
+              appTip="ISO country code. Saved when you leave the field."
+            />
           </div>
         }
 
-        <label class="checkbox" for="ad-large">
+        <label
+          class="checkbox"
+          for="ad-large"
+          appTip="Large: the showcase layout with the targeting shown. Off: a compact card."
+        >
           <input
             type="checkbox"
             id="ad-large"
             [checked]="ads.large()"
             (change)="ads.setLarge($any($event.target).checked)"
-            [disabled]="!ads.enabled()"
-            appTip="Large panel: about a third of the page, with the country and language it was picked for highlighted (showcase/debug view). Off: the compact card."
           />
-          <span>Large panel with targeting highlighted (showcase view)</span>
+          <span>Large panel (show how it was targeted)</span>
         </label>
 
-        <p class="muted small">
-          Your choices here are saved on this device only. Pro and Lifetime memberships have no
-          sponsored content.
-        </p>
+        @if (ads.source()?.third_party) {
+          <div class="callout" id="ad-consent-state">
+            <strong>Third-party provider</strong>
+            @if (ads.consent()) {
+              <span
+                >You allowed {{ ads.source()?.provider_name || 'the provider' }} on this device.
+                <button
+                  class="link"
+                  type="button"
+                  id="ad-consent-withdraw"
+                  (click)="withdraw()"
+                  appTip="The provider's script is no longer loaded; the consent card comes back."
+                >
+                  Withdraw
+                </button></span
+              >
+            } @else {
+              <span>Not allowed yet — the panel shows a consent card instead of the provider.</span>
+            }
+            @if (ads.source()?.privacy_url; as url) {
+              <a [href]="url" target="_blank" rel="noopener noreferrer" class="small"
+                >Privacy policy ↗</a
+              >
+            }
+          </div>
+        }
+
         <div class="dialog-actions">
           @if (membership.canUpgrade()) {
             <button
               class="btn"
               type="button"
               id="ad-info-upgrade"
-              (click)="goPro()"
-              appTip="Open the account screen to start a trial or subscribe. Pro has unlimited tasks, encrypted sync and no sponsored content."
+              (click)="goUpgrade()"
+              appTip="Pro and Lifetime memberships have no sponsored content."
             >
-              Go Pro — no sponsored content
+              Go ad-free with Pro
             </button>
           }
           <span class="spacer"></span>
@@ -185,42 +168,64 @@ import { countryName, countryOptions } from './region';
 export class AdInfoDialog {
   readonly ads = inject(AdsService);
   readonly membership = inject(MembershipService);
+  private readonly toast = inject(ToastService);
   readonly dialog = viewChild.required(DialogDirective);
-  /** The shell opens the account dialog (trial / subscribe). */
   readonly upgrade = output<void>();
 
-  readonly countries = countryOptions();
+  readonly mode = signal<AdRegionMode>('auto');
+  readonly regionInput = signal('');
 
-  readonly detectedLabel = computed(() => {
-    const d = this.ads.detected();
-    if (!d.region) return 'no country could be derived';
-    return `${countryName(d.region)} (from ${d.source === 'timezone' ? 'time zone' : 'language'})`;
+  readonly regionText = computed(() => {
+    const r = this.ads.response()?.region ?? this.ads.region();
+    const how =
+      this.ads.regionMode() === 'manual'
+        ? 'chosen by you'
+        : this.ads.regionMode() === 'off'
+          ? 'not sent'
+          : 'derived on this device';
+    return !r || r === 'ZZ' ? `none (${how})` : `${r} (${how})`;
   });
 
-  readonly regionLabel = computed(() => {
-    const mode = this.ads.effectiveMode();
-    const region = this.ads.region();
-    if (!this.ads.enabled()) return 'sponsored content is off';
-    if (mode === 'off' || region === 'ZZ') return 'none (worldwide offers only)';
-    if (!region) return 'unknown (worldwide offers only)';
-    return `${countryName(region)}${mode === 'manual' ? ' (chosen by you)' : ' (detected on this device)'}`;
-  });
-
-  open() {
+  open(): void {
+    this.mode.set(this.ads.regionMode());
+    this.regionInput.set(this.ads.region() && this.ads.region() !== 'ZZ' ? this.ads.region()! : '');
     this.dialog().open();
   }
 
-  setMode(mode: AdRegionMode) {
-    this.ads.setRegionMode(mode);
+  close(): void {
+    this.applyRegion();
+    this.dialog().close();
   }
 
-  goPro() {
+  toggleEnabled(on: boolean): void {
+    this.ads.setEnabled(on);
+    this.toast.show(on ? 'Sponsored content is on' : 'Sponsored content is off on this device');
+  }
+
+  setMode(mode: AdRegionMode): void {
+    this.mode.set(mode);
+    if (mode !== 'manual') this.ads.setRegionMode(mode);
+    else this.applyRegion();
+  }
+
+  applyRegion(): void {
+    if (this.mode() !== 'manual') return;
+    const code = this.regionInput().trim().toUpperCase();
+    if (isValidRegion(code)) {
+      this.regionInput.set(code);
+      this.ads.setRegionMode('manual', code);
+    } else if (code) {
+      this.toast.error('Please enter a two-letter country code, e.g. US or DE.');
+    }
+  }
+
+  withdraw(): void {
+    this.ads.setConsent(false);
+    this.toast.show('Consent withdrawn — the provider is no longer loaded.');
+  }
+
+  goUpgrade(): void {
     this.dialog().close();
     this.upgrade.emit();
-  }
-
-  withdraw() {
-    const src = this.ads.source();
-    if (src) this.ads.withdrawConsent(src.kind);
   }
 }

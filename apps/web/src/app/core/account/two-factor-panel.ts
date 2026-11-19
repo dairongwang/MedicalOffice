@@ -2,6 +2,7 @@ import { NgTemplateOutlet } from '@angular/common';
 import { Component, DestroyRef, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { DomSanitizer, type SafeUrl } from '@angular/platform-browser';
+import { PasswordToggleDirective } from '../ui/password-toggle.directive';
 import { TipDirective } from '../ui/tip.directive';
 import { ToastService } from '../ui/toast.service';
 import {
@@ -46,7 +47,7 @@ const METHOD_HINT: Record<TwoFactorMethod, string> = {
  */
 @Component({
   selector: 'app-two-factor-panel',
-  imports: [FormsModule, NgTemplateOutlet, TipDirective],
+  imports: [FormsModule, NgTemplateOutlet, PasswordToggleDirective, TipDirective],
   template: `
     <div class="field two-factor" id="two-factor">
       <span class="muted small">Two-factor authentication</span>
@@ -202,6 +203,7 @@ const METHOD_HINT: Record<TwoFactorMethod, string> = {
               id="tfa-password"
               name="tfa-password"
               type="password"
+              appPasswordToggle
               [(ngModel)]="password"
               autocomplete="current-password"
               (keydown.enter)="enter($event)"
@@ -486,6 +488,7 @@ const METHOD_HINT: Record<TwoFactorMethod, string> = {
             id="tfa-password"
             name="tfa-password"
             type="password"
+            appPasswordToggle
             [(ngModel)]="password"
             autocomplete="current-password"
             (keydown.enter)="enter($event)"
@@ -805,7 +808,7 @@ export class TwoFactorPanel {
     const who = this.account.session()?.email ?? '';
     // CRLF: opens cleanly in Notepad on Windows as well as on macOS, Linux, iOS and Android.
     return [
-      `Personal Assistant - recovery codes for ${who}`,
+      `Medic Office management - recovery codes for ${who}`,
       'Each code signs you in once if your phone or authenticator is unavailable.',
       '',
       ...this.codes(),

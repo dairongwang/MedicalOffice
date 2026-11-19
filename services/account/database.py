@@ -64,6 +64,24 @@ def migrate() -> str:
     return result
 
 
+def schema_status() -> str:
+    """``"at 0027_validations_outlive_methods (current)"`` or ``"at 0025_… — 2 migration(s) pending"``:
+    what `dev.py db status` shows, without changing anything."""
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(_alembic_config())
+    head = script.get_current_head()
+    with engine.connect() as conn:
+        current = MigrationContext.configure(conn).get_current_revision()
+    if current is None:
+        return "no tables yet — created at the next start (or: python dev.py db upgrade)"
+    if current == head:
+        return f"at {current} (current)"
+    pending = sum(1 for _ in script.iterate_revisions(head, current))
+    return f"at {current} — {pending} migration(s) pending (python dev.py db upgrade, or just start the API)"
+
+
 def init_db() -> None:
     """Called at application startup."""
     if DATABASE_IS_SQLITE:

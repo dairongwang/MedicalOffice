@@ -211,3 +211,14 @@ export function createMembership(
 }
 
 export const ANONYMOUS: MembershipStrategy = new AnonymousMembership();
+
+/** The header/task-list tooltip: who is signed in, the membership and its usage, the upsell. */
+export function membershipTipText(
+  strategy: MembershipStrategy,
+  usage: string,
+  email: string | null | undefined,
+): string {
+  const who = strategy.hasAccount ? `Signed in as ${email ?? ''}. ` : 'No account. ';
+  const hint = strategy.upgradeHint();
+  return `${who}${strategy.label} membership: ${usage}${strategy.maxActiveTasks === null ? ' (unlimited)' : ''}.${hint ? ' ' + hint : ''} Tap for account options.`;
+}

@@ -27,7 +27,9 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
+import shutil
 import smtplib
 import ssl
 import threading
@@ -40,7 +42,7 @@ from email.utils import make_msgid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 
 import config
 import httpclient
@@ -58,6 +60,15 @@ class MessagingError(Exception):
 
 
 @dataclass
+class Attachment:
+    """A file sent with an e-mail (e.g. a prescription PDF to a pharmacy). Text messages carry none."""
+
+    filename: str
+    content_type: str
+    data: bytes
+
+
+@dataclass
 class Message:
     channel: str  # email | sms
     to: str
@@ -66,6 +77,8 @@ class Message:
     id: str = field(default_factory=lambda: secrets.token_hex(8))
     sent_at: str = field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
     provider: str = ""
+    # What was attached: [{filename, content_type, size, url}] (the url: the fake outbox's copy).
+    attachments: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------- the fake
@@ -84,6 +97,18 @@ class FakeOutbox:
     def path(self):
         return config.DATA_DIR / "message_outbox.json"
 
+    @property
+    def files_dir(self):
+        return config.DATA_DIR / "message_outbox_files"
+
+    def file_path(self, message_id: str, filename: str):
+        """Where the fake keeps an attachment — None for names that could leave the folder."""
+        if not re.fullmatch(r"[0-9a-f]{16}", message_id or "") or not re.fullmatch(r"[\w.\- ]{1,120}", filename or ""):
+            return None
+        if filename.startswith("."):
+            return None
+        return self.files_dir / message_id / filename
+
     def _read(self) -> list[dict[str, Any]]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -97,11 +122,22 @@ class FakeOutbox:
             tmp = self.path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(messages[-self.KEEP :], indent=1), encoding="utf-8")
             os.replace(tmp, self.path)
+            for dropped in messages[: -self.KEEP] if len(messages) > self.KEEP else []:
+                shutil.rmtree(self.files_dir / str(dropped.get("id", "")), ignore_errors=True)
         except OSError as exc:  # pragma: no cover - read-only data dir
             log.warning("could not write the fake outbox: %s", exc)
 
-    def deliver(self, message: Message) -> str:
+    def deliver(self, message: Message, files: list[Attachment] | None = None) -> str:
         message.provider = f"fake-{message.channel}"
+        for f in files or []:
+            target = self.file_path(message.id, f.filename)
+            if target is None:
+                continue
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(f.data)
+            except OSError as exc:  # pragma: no cover - read-only data dir
+                log.warning("could not keep the attachment %s: %s", f.filename, exc)
         with self._lock:
             messages = self._read()
             messages.append(asdict(message))
@@ -133,6 +169,7 @@ class FakeOutbox:
     def clear(self) -> None:
         with self._lock:
             self._write([])
+            shutil.rmtree(self.files_dir, ignore_errors=True)
 
 
 OUTBOX = FakeOutbox()
@@ -187,17 +224,28 @@ class Channel:
     def available(self) -> bool:
         return self.configured() or self.fake
 
-    def send(self, to: str, body: str, subject: str = "") -> Message:
+    def send(self, to: str, body: str, subject: str = "", attachments: list[Attachment] | None = None) -> Message:
+        """Send the message; ``attachments`` go with an e-mail (a text message carries none)."""
         if not self.available:
             raise MessagingError(f"{self.label} is not set up on this server")
+        files = list(attachments or []) if self.name == EMAIL else []
         message = Message(channel=self.name, to=to, body=body, subject=subject)
+        message.attachments = [
+            {
+                "filename": f.filename,
+                "content_type": f.content_type,
+                "size": len(f.data),
+                "url": f"{OUTBOX_PATH}/{message.id}/files/{urllib.parse.quote(f.filename)}" if self.fake else None,
+            }
+            for f in files
+        ]
         if self.fake:
-            OUTBOX.deliver(message)
+            OUTBOX.deliver(message, files)
         else:
-            message.provider = self._deliver(message)
+            message.provider = self._deliver(message, files)
         return message
 
-    def _deliver(self, message: Message) -> str:
+    def _deliver(self, message: Message, attachments: list[Attachment]) -> str:
         raise NotImplementedError
 
     def describe(self) -> dict[str, Any]:
@@ -214,7 +262,7 @@ class EmailChannel(Channel):
     def configured(self) -> bool:
         return bool(config.SMTP_HOST)
 
-    def _deliver(self, message: Message) -> str:
+    def _deliver(self, message: Message, attachments: list[Attachment]) -> str:
         mail = EmailMessage()
         mail["From"] = config.EMAIL_FROM
         mail["To"] = message.to
@@ -222,6 +270,9 @@ class EmailChannel(Channel):
         mail["Message-ID"] = make_msgid(domain=(config.EMAIL_FROM.rsplit("@", 1)[-1].strip(" >") or None))
         mail["Auto-Submitted"] = "auto-generated"  # RFC 3834: no out-of-office replies
         mail.set_content(message.body)
+        for f in attachments:
+            maintype, _, subtype = f.content_type.partition("/")
+            mail.add_attachment(f.data, maintype=maintype, subtype=subtype or "octet-stream", filename=f.filename)
         try:
             server = self.smtp_factory()
             try:
@@ -252,7 +303,7 @@ class SmsChannel(Channel):
             and (config.TWILIO_FROM or config.TWILIO_MESSAGING_SERVICE_SID)
         )
 
-    def _deliver(self, message: Message) -> str:
+    def _deliver(self, message: Message, attachments: list[Attachment]) -> str:
         fields = {"To": message.to, "Body": message.body}
         if config.TWILIO_MESSAGING_SERVICE_SID:
             fields["MessagingServiceSid"] = config.TWILIO_MESSAGING_SERVICE_SID
@@ -311,6 +362,26 @@ def outbox_clear():
     return {"ok": True}
 
 
+@router.get("/outbox/{message_id}/files/{filename}")
+def outbox_file(message_id: str, filename: str):
+    """An attachment of a message the fake "sent" (e.g. a prescription PDF e-mailed to a pharmacy)."""
+    _guard()
+    target = OUTBOX.file_path(message_id, filename)
+    if target is None or not target.is_file():
+        raise HTTPException(status_code=404)
+    media = next(
+        (
+            a.get("content_type")
+            for m in OUTBOX.messages()
+            if m.get("id") == message_id
+            for a in m.get("attachments", [])
+            if a.get("filename") == filename
+        ),
+        "application/octet-stream",
+    )
+    return FileResponse(target, media_type=media, filename=filename, headers={"Cache-Control": "no-store"})
+
+
 @router.get("/outbox", response_class=HTMLResponse)
 def outbox_page(to: str | None = Query(default=None)):
     """A test inbox for every e-mail and text the fake "sent". Refreshes itself; sized for phones."""
@@ -319,11 +390,17 @@ def outbox_page(to: str | None = Query(default=None)):
     for m in OUTBOX.messages(to=to)[:50]:
         icon = "✉️" if m.get("channel") == EMAIL else "💬"
         subject = f"<div class=subj>{html.escape(m.get('subject') or '')}</div>" if m.get("subject") else ""
+        files = "".join(
+            f'<div class=att>📎 <a href="{html.escape(a["url"])}" target=_blank>'
+            f"{html.escape(a.get('filename', ''))}</a> ({int(a.get('size') or 0) // 1024 + 1} KB)</div>"
+            for a in m.get("attachments") or []
+            if a.get("url")
+        )
         rows.append(
             f"<li class=msg data-channel='{html.escape(m.get('channel', ''))}'>"
             f"<div class=meta>{icon} <strong>{html.escape(m.get('to', ''))}</strong> · "
             f"{html.escape(m.get('sent_at', ''))}</div>{subject}"
-            f"<pre>{html.escape(m.get('body', ''))}</pre></li>"
+            f"<pre>{html.escape(m.get('body', ''))}</pre>{files}</li>"
         )
     body = "".join(rows) or "<li class=empty>No messages yet. Ask for a code in the app; it shows up here.</li>"
     return HTMLResponse(
@@ -337,6 +414,7 @@ body{{font-family:system-ui,sans-serif;max-width:640px;margin:0 auto;padding:16p
 ul{{list-style:none;padding:0;display:grid;gap:10px}}
 .msg{{border:1px solid #e2e5ea;border-radius:10px;padding:10px 12px;background:#fff}}
 .meta{{font-size:13px;color:#6b7280;overflow-wrap:anywhere}} .subj{{font-weight:600;margin-top:4px}}
+.att{{margin-top:6px;font-size:14px}}
 pre{{white-space:pre-wrap;overflow-wrap:anywhere;font:15px/1.45 ui-monospace,Menlo,Consolas,monospace;margin:6px 0 0}}
 @media (prefers-color-scheme:dark){{body{{background:#111318;color:#e5e7eb}}
 .msg{{background:#1a1d24;border-color:#2a2f3a}}}}
